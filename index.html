@@ -4,7 +4,9 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>نظام توزيع الاتصالات - لوحة التحكم</title>
+    <!-- Tailwind CSS UI -->
     <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
+    <!-- FontAwesome Icons -->
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
     <style>
         @import url('https://fonts.googleapis.com/css2?family=Cairo:wght@300;400;600;700&display=swap');
@@ -13,7 +15,6 @@
 </head>
 <body class="bg-gray-50 text-gray-800">
     <script>
-        // الرابط الخاص بك المربوط بالسيرفر المباشر
         const API_BASE_URL = "https://alisaidarafat.onrender.com";
         let ws;
 
@@ -91,27 +92,14 @@
             ws.onmessage = function(event) {
                 const msg = JSON.parse(event.data);
                 if (msg.event === "new_order" || msg.event === "status_updated" || msg.event === "order_update") {
-                    const user = JSON.parse(localStorage.getItem("user"));
-                    if(user.role === 'admin') {
-                        loadAdminStats();
-                        loadTransactions();
-                    } else {
-                        // تحديث رصيد الموزع إذا تغيرت الحالة
-                        if(msg.data.reseller_id === user._id) {
-                            refreshResellerBalance();
-                            loadTransactions();
-                        }
-                    }
+                    loadAdminStats();
+                    loadTransactions();
+                    loadAdminResellers();
                 }
             };
         }
 
-        async function refreshResellerBalance() {
-            // تحديث سريع للرصيد عبر تسجيل دخول صامت أو تحديث من المعاملات
-            loadTransactions();
-        }
-
-        // دالة جلب إحصائيات الأدمن
+        // جلب إحصائيات الأدمن
         async function loadAdminStats() {
             const token = localStorage.getItem("token");
             try {
@@ -132,12 +120,12 @@
                 const pkgs = await res.json();
                 const container = document.getElementById("admin-packages-list");
                 container.innerHTML = pkgs.map(p => `
-                    <div class="bg-gray-50 p-4 rounded-xl border border-gray-200 flex justify-between items-center">
+                    <div class="bg-gray-50 p-3 rounded-xl border border-gray-200 flex justify-between items-center shadow-2xs">
                         <div>
-                            <h4 class="font-bold text-gray-800">${p.name}</h4>
-                            <p class="text-xs text-gray-500">التكلفة: ${p.cost_price} | البيع: ${p.sale_price} شيكل</p>
+                            <h4 class="font-bold text-gray-800 text-sm">${p.name}</h4>
+                            <p class="text-xs text-gray-500">التكلفة: ${p.cost_price} | البيع: ${p.sale_price} ₪</p>
                         </div>
-                        <span class="px-2 py-1 text-xs rounded-lg font-bold ${p.type === 'jawwal' ? 'bg-orange-100 text-orange-700':'bg-blue-100 text-blue-700'}">${p.type.toUpperCase()}</span>
+                        <span class="px-2 py-0.5 text-xs rounded-lg font-bold ${p.type === 'jawwal' ? 'bg-orange-100 text-orange-700':'bg-blue-100 text-blue-700'}">${p.type.toUpperCase()}</span>
                     </div>
                 `).join('');
             } catch (err) { console.error(err); }
@@ -153,16 +141,26 @@
                 category: document.getElementById("p-cat").value,
                 cost_price: parseFloat(document.getElementById("p-cost").value),
                 sale_price: parseFloat(document.getElementById("p-sale").value),
-                description: ""
+                description: "حزمة مضافة من الإدارة"
             };
-            await fetch(`${API_BASE_URL}/api/admin/packages`, {
-                method: "POST",
-                headers: { "Content-Type": "application/json", "Authorization": `Bearer ${token}` },
-                body: JSON.stringify(body)
-            });
-            document.getElementById("pkg-form").reset();
-            loadAdminStats();
-            loadAdminPackages();
+            
+            try {
+                const res = await fetch(`${API_BASE_URL}/api/admin/packages`, {
+                    method: "POST",
+                    headers: { 
+                        "Content-Type": "application/json", 
+                        "Authorization": `Bearer ${token}` 
+                    },
+                    body: JSON.stringify(body)
+                });
+                if(res.ok) {
+                    document.getElementById("pkg-form").reset();
+                    loadAdminStats();
+                    loadAdminPackages();
+                } else {
+                    alert("فشل في إضافة الحزمة، تحقق من السيرفر.");
+                }
+            } catch(err) { alert("حدث خطأ في الاتصال"); }
         }
 
         // جلب الموزعين للأدمن
@@ -179,12 +177,12 @@
                 }
                 const container = document.getElementById("admin-resellers-list");
                 container.innerHTML = resellers.map(r => `
-                    <div class="bg-gray-50 p-4 rounded-xl border border-gray-200 flex justify-between items-center">
+                    <div class="bg-gray-50 p-3 rounded-xl border border-gray-200 flex justify-between items-center shadow-2xs">
                         <div>
-                            <h4 class="font-bold text-gray-800">${r.name}</h4>
+                            <h4 class="font-bold text-gray-800 text-sm">${r.name}</h4>
                             <p class="text-xs text-gray-500">حساب: ${r.username} | هاتف: ${r.phone}</p>
                         </div>
-                        <span class="bg-emerald-100 text-emerald-800 font-bold px-3 py-1 rounded-full text-sm">${r.balance.toFixed(2)} شيكل</span>
+                        <span class="bg-emerald-100 text-emerald-800 font-bold px-2 py-0.5 rounded-full text-xs">${r.balance.toFixed(2)} ₪</span>
                     </div>
                 `).join('');
             } catch (err) { console.error(err); }
@@ -199,20 +197,29 @@
                 password: document.getElementById("r-pass").value,
                 name: document.getElementById("r-name").value,
                 phone: document.getElementById("r-phone").value,
-                balance: parseFloat(document.getElementById("r-balance").value || 0)
+                balance: parseFloat(document.getElementById("r-balance").value || 0),
+                role: "reseller",
+                is_active: true
             };
-            const res = await fetch(`${API_BASE_URL}/api/admin/resellers`, {
-                method: "POST",
-                headers: { "Content-Type": "application/json", "Authorization": `Bearer ${token}` },
-                body: JSON.stringify(body)
-            });
-            if(res.ok) {
-                document.getElementById("reseller-form").reset();
-                loadAdminStats();
-                loadAdminResellers();
-            } else {
-                alert("اسم المستخدم موجود مسبقاً");
-            }
+            
+            try {
+                const res = await fetch(`${API_BASE_URL}/api/admin/resellers`, {
+                    method: "POST",
+                    headers: { 
+                        "Content-Type": "application/json", 
+                        "Authorization": `Bearer ${token}` 
+                    },
+                    body: JSON.stringify(body)
+                });
+                if(res.ok) {
+                    document.getElementById("reseller-form").reset();
+                    loadAdminStats();
+                    loadAdminResellers();
+                } else {
+                    const errData = await res.json();
+                    alert(errData.detail || "اسم المستخدم موجود مسبقاً أو هناك حقل ناقص");
+                }
+            } catch(err) { alert("حدث خطأ في الاتصال"); }
         }
 
         // شحن رصيد للموزع
@@ -232,7 +239,7 @@
             loadAdminResellers();
         }
 
-        // جلب العمليات والطلبات للجميع
+        // جلب المعاملات
         async function loadTransactions() {
             const token = localStorage.getItem("token");
             const user = JSON.parse(localStorage.getItem("user"));
@@ -253,8 +260,8 @@
                     if(user.role === 'admin' && t.status === 'pending') {
                         actionBtn = `
                             <div class="flex gap-1 mt-1">
-                                <button onclick="changeTxStatus('${t._id}', 'completed')" class="bg-green-500 hover:bg-green-600 text-white text-xs px-2 py-1 rounded transition-colors">قبول</button>
-                                <button onclick="changeTxStatus('${t._id}', 'refunded')" class="bg-red-500 hover:bg-red-600 text-white text-xs px-2 py-1 rounded transition-colors">رفض</button>
+                                <button onclick="changeTxStatus('${t._id}', 'completed')" class="bg-green-500 hover:bg-green-600 text-white text-xs px-2 py-1 rounded cursor-pointer">قبول</button>
+                                <button onclick="changeTxStatus('${t._id}', 'refunded')" class="bg-red-500 hover:bg-red-600 text-white text-xs px-2 py-1 rounded cursor-pointer">رفض</button>
                             </div>
                         `;
                     }
@@ -264,7 +271,7 @@
                             <td class="p-3 text-right">${t.reseller_name}</td>
                             <td class="p-3 text-right font-medium">${t.details}</td>
                             <td class="p-3 text-right font-mono">${t.target}</td>
-                            <td class="p-3 text-right font-bold text-blue-600">${t.amount} شيكل</td>
+                            <td class="p-3 text-right font-bold text-blue-600">${t.amount} ₪</td>
                             <td class="p-3 text-right">${statusBadge} ${actionBtn}</td>
                         </tr>
                     `;
@@ -283,7 +290,6 @@
             loadTransactions();
         }
 
-        // جلب الحزم للموزع لشراءها
         async function loadResellerPackages() {
             try {
                 const res = await fetch(`${API_BASE_URL}/api/admin/packages`);
@@ -298,7 +304,7 @@
                         <h4 class="font-bold text-gray-800 text-base mb-4">${p.name}</h4>
                         <div class="flex justify-between items-center mt-auto">
                             <span class="text-lg font-bold text-emerald-600">${p.sale_price} ₪</span>
-                            <button onclick="openOrderModal('${p._id}', '${p.name}', ${p.sale_price})" class="bg-emerald-600 hover:bg-emerald-700 text-white font-semibold text-xs px-4 py-2 rounded-xl transition-colors">طلب الآن</button>
+                            <button onclick="openOrderModal('${p._id}', '${p.name}', ${p.sale_price})" class="bg-emerald-600 hover:bg-emerald-700 text-white font-semibold text-xs px-4 py-2 rounded-xl">طلب الآن</button>
                         </div>
                     </div>
                 `).join('');
@@ -320,7 +326,7 @@
         async function submitOrder() {
             const token = localStorage.getItem("token");
             const target = document.getElementById("target-phone").value;
-            if(!target) return alert("الرجاء إدخال رقم الهاتف");
+            if(!target) return alert("الرجاء إدخل رقم الهاتف");
             
             const res = await fetch(`${API_BASE_URL}/api/reseller/order?token=${token}`, {
                 method: "POST",
@@ -329,7 +335,7 @@
             });
             const data = await res.json();
             if(res.ok) {
-                alert("تم إرسال طلبك بنجاح وهو قيد التنفيذ الآن!");
+                alert("تم إرسال طلبك بنجاح!");
                 document.getElementById("reseller-balance").innerText = data.new_balance.toFixed(2);
                 closeOrderModal();
                 loadTransactions();
@@ -338,7 +344,6 @@
             }
         }
 
-        // إعداد التلغرام للأدمن
         async function saveTelegramConfig(e) {
             e.preventDefault();
             const token = localStorage.getItem("token");
@@ -352,6 +357,7 @@
         }
     </script>
 
+    <!-- 1️⃣ صفحة تسجيل الدخول -->
     <div id="login-page" class="page min-h-screen flex items-center justify-center px-4">
         <div class="max-w-md w-full bg-white rounded-2xl shadow-xl p-8 border border-gray-100">
             <div class="text-center mb-8">
@@ -371,11 +377,12 @@
                     <label class="block text-sm font-semibold text-gray-700 mb-1">كلمة المرور</label>
                     <input type="password" id="password" required class="w-full px-4 py-2.5 rounded-xl border border-gray-200 outline-none focus:border-blue-500">
                 </div>
-                <button type="submit" class="w-full bg-blue-600 hover:bg-blue-700 text-white font-semibold py-3 rounded-xl transition-all shadow-lg">دخول</button>
+                <button type="submit" class="w-full bg-blue-600 hover:bg-blue-700 text-white font-semibold py-3 rounded-xl transition-all shadow-lg cursor-pointer">دخول</button>
             </form>
         </div>
     </div>
 
+    <!-- 2️⃣ لوحة تحكم الأدمن -->
     <div id="admin-page" class="page hidden min-h-screen flex flex-col">
         <header class="bg-white border-b border-gray-100 px-6 py-4 flex justify-between items-center shadow-sm">
             <div class="flex items-center gap-3">
@@ -383,17 +390,18 @@
                 <span class="text-gray-300">|</span>
                 <span class="user-name-display text-gray-600 font-medium text-sm"></span>
             </div>
-            <button onclick="logout()" class="text-red-500 hover:text-red-700 font-bold text-sm flex items-center gap-1"><i class="fa-solid fa-arrow-right-from-bracket"></i> خروج</button>
+            <button onclick="logout()" class="text-red-500 hover:text-red-700 font-bold text-sm flex items-center gap-1 cursor-pointer"><i class="fa-solid fa-arrow-right-from-bracket"></i> خروج</button>
         </header>
 
         <main class="flex-1 p-6 max-w-7xl w-full mx-auto space-y-6">
+            <!-- الإحصائيات -->
             <div class="grid grid-cols-1 md:grid-cols-3 gap-6">
                 <div class="bg-white p-6 rounded-2xl border border-gray-100 flex justify-between items-center shadow-sm">
                     <div><p class="text-gray-400 text-xs">الموزعين</p><h3 id="stat-resellers" class="text-2xl font-bold text-gray-800">0</h3></div>
                     <div class="w-10 h-10 bg-blue-50 text-blue-600 rounded-xl flex items-center justify-center text-lg"><i class="fa-solid fa-users"></i></div>
                 </div>
                 <div class="bg-white p-6 rounded-2xl border border-gray-100 flex justify-between items-center shadow-sm">
-                    <div><p class="text-gray-400 text-xs">الحزم والإقامات</p><h3 id="stat-packages" class="text-2xl font-bold text-gray-800">0</h3></div>
+                    <div><p class="text-gray-400 text-xs">الحزم والعروض</p><h3 id="stat-packages" class="text-2xl font-bold text-gray-800">0</h3></div>
                     <div class="w-10 h-10 bg-green-50 text-green-600 rounded-xl flex items-center justify-center text-lg"><i class="fa-solid fa-box"></i></div>
                 </div>
                 <div class="bg-white p-6 rounded-2xl border border-gray-100 flex justify-between items-center shadow-sm">
@@ -404,50 +412,54 @@
 
             <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
                 <div class="space-y-6 lg:col-span-1">
+                    <!-- حزمة جديدة -->
                     <div class="bg-white p-5 rounded-2xl border border-gray-100 shadow-sm">
                         <h3 class="font-bold text-gray-800 mb-4"><i class="fa-solid fa-plus text-blue-500 ml-1"></i> إضافة حزمة / عرض</h3>
                         <form id="pkg-form" onsubmit="addPackage(event)" class="space-y-3">
-                            <input type="text" id="p-name" placeholder="اسم الحزمة (مثال: جوال 50 شيكل صافي)" required class="w-full px-3 py-2 border rounded-xl text-sm outline-none">
+                            <input type="text" id="p-name" placeholder="اسم الحزمة (جوال 50 شيكل)" required class="w-full px-3 py-2 border rounded-xl text-sm outline-none focus:border-blue-500">
                             <div class="grid grid-cols-2 gap-2">
-                                <select id="p-type" class="w-full px-3 py-2 border rounded-xl text-sm outline-none"><option value="jawwal">جوال</option><option value="ooredoo">أوريدو</option></select>
-                                <select id="p-cat" class="w-full px-3 py-2 border rounded-xl text-sm outline-none"><option value="credit">رصيد</option><option value="bundle">حزم</option></select>
+                                <select id="p-type" class="w-full px-3 py-2 border rounded-xl text-sm outline-none focus:border-blue-500"><option value="jawwal">جوال</option><option value="ooredoo">أوريدو</option></select>
+                                <select id="p-cat" class="w-full px-3 py-2 border rounded-xl text-sm outline-none focus:border-blue-500"><option value="credit">رصيد</option><option value="bundle">حزم</option></select>
                             </div>
                             <div class="grid grid-cols-2 gap-2">
-                                <input type="number" step="0.1" id="p-cost" placeholder="سعر التكلفة" required class="w-full px-3 py-2 border rounded-xl text-sm outline-none">
-                                <input type="number" step="0.1" id="p-sale" placeholder="سعر البيع" required class="w-full px-3 py-2 border rounded-xl text-sm outline-none">
+                                <input type="number" step="0.1" id="p-cost" placeholder="سعر التكلفة" required class="w-full px-3 py-2 border rounded-xl text-sm outline-none focus:border-blue-500">
+                                <input type="number" step="0.1" id="p-sale" placeholder="سعر البيع للموزع" required class="w-full px-3 py-2 border rounded-xl text-sm outline-none focus:border-blue-500">
                             </div>
-                            <button class="w-full bg-blue-600 hover:bg-blue-700 text-white text-sm font-semibold py-2 rounded-xl transition-colors">حفظ الحزمة</button>
+                            <button type="submit" class="w-full bg-blue-600 hover:bg-blue-700 text-white text-sm font-semibold py-2 rounded-xl transition-colors cursor-pointer">حفظ الحزمة</button>
                         </form>
                     </div>
 
+                    <!-- موزع جديد -->
                     <div class="bg-white p-5 rounded-2xl border border-gray-100 shadow-sm">
                         <h3 class="font-bold text-gray-800 mb-4"><i class="fa-solid fa-user-plus text-green-500 ml-1"></i> إضافة موزع جديد</h3>
                         <form id="reseller-form" onsubmit="addReseller(event)" class="space-y-3">
-                            <input type="text" id="r-name" placeholder="اسم الموزع بالكامل" required class="w-full px-3 py-2 border rounded-xl text-sm outline-none">
-                            <input type="text" id="r-phone" placeholder="رقم الجوال للاتصال" required class="w-full px-3 py-2 border rounded-xl text-sm outline-none">
+                            <input type="text" id="r-name" placeholder="اسم الموزع بالكامل" required class="w-full px-3 py-2 border rounded-xl text-sm outline-none focus:border-green-500">
+                            <input type="text" id="r-phone" placeholder="رقم الجوال" required class="w-full px-3 py-2 border rounded-xl text-sm outline-none focus:border-green-500">
                             <div class="grid grid-cols-2 gap-2">
-                                <input type="text" id="r-user" placeholder="اسم المستخدم" required class="w-full px-3 py-2 border rounded-xl text-sm outline-none">
-                                <input type="password" id="r-pass" placeholder="كلمة المرور" required class="w-full px-3 py-2 border rounded-xl text-sm outline-none">
+                                <input type="text" id="r-user" placeholder="اسم المستخدم للدخول" required class="w-full px-3 py-2 border rounded-xl text-sm outline-none focus:border-green-500">
+                                <input type="password" id="r-pass" placeholder="كلمة المرور" required class="w-full px-3 py-2 border rounded-xl text-sm outline-none focus:border-green-500">
                             </div>
-                            <input type="number" id="r-balance" placeholder="الرصيد الافتتاحي (اختياري)" class="w-full px-3 py-2 border rounded-xl text-sm outline-none">
-                            <button class="w-full bg-green-600 hover:bg-green-700 text-white text-sm font-semibold py-2 rounded-xl transition-colors">إنشاء الحساب</button>
+                            <input type="number" id="r-balance" placeholder="الرصيد الافتتاحي" class="w-full px-3 py-2 border rounded-xl text-sm outline-none focus:border-green-500">
+                            <button type="submit" class="w-full bg-green-600 hover:bg-green-700 text-white text-sm font-semibold py-2 rounded-xl transition-colors cursor-pointer">إنشاء الحساب</button>
                         </form>
                     </div>
 
+                    <!-- رصيد موزع -->
                     <div class="bg-white p-5 rounded-2xl border border-gray-100 shadow-sm">
                         <h3 class="font-bold text-gray-800 mb-4"><i class="fa-solid fa-money-bill-transfer text-amber-500 ml-1"></i> شحن رصيد لموزع</h3>
                         <form id="balance-form" onsubmit="updateBalance(event)" class="space-y-3">
                             <select id="r-select-balance" required class="w-full px-3 py-2 border rounded-xl text-sm outline-none"></select>
-                            <input type="number" step="0.1" id="b-amount" placeholder="القيمة (مثال: 500 لشحن، أو -100 للخصم)" required class="w-full px-3 py-2 border rounded-xl text-sm outline-none">
-                            <button class="w-full bg-amber-500 hover:bg-amber-600 text-white text-sm font-semibold py-2 rounded-xl transition-colors">تعديل الرصيد فورا</button>
+                            <input type="number" step="0.1" id="b-amount" placeholder="القيمة (شحن 500 أو خصم -100)" required class="w-full px-3 py-2 border rounded-xl text-sm outline-none">
+                            <button type="submit" class="w-full bg-amber-500 hover:bg-amber-600 text-white text-sm font-semibold py-2 rounded-xl transition-colors cursor-pointer">تعديل الرصيد فورا</button>
                         </form>
                     </div>
 
+                    <!-- إعداد تليجرام -->
                     <div class="bg-white p-5 rounded-2xl border border-gray-100 shadow-sm">
                         <h3 class="font-bold text-gray-800 mb-3"><i class="fa-brands fa-telegram text-sky-500 ml-1"></i> ربط تنبيهات Telegram</h3>
                         <form onsubmit="saveTelegramConfig(event)" class="space-y-2">
-                            <input type="text" id="tele-chat-id" placeholder="أدخل الـ Chat ID الخاص بك" required class="w-full px-3 py-2 border rounded-xl text-sm outline-none">
-                            <button class="w-full bg-sky-500 hover:bg-sky-600 text-white text-xs font-semibold py-2 rounded-xl transition-colors">حفظ وتفعيل</button>
+                            <input type="text" id="tele-chat-id" placeholder="أدخل الـ Chat ID" required class="w-full px-3 py-2 border rounded-xl text-sm outline-none">
+                            <button type="submit" class="w-full bg-sky-500 hover:bg-sky-600 text-white text-xs font-semibold py-2 rounded-xl transition-colors cursor-pointer">حفظ وتفعيل</button>
                         </form>
                     </div>
                 </div>
@@ -472,35 +484,35 @@
                     </div>
 
                     <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
-                        <div class="bg-white p-4 rounded-2xl border border-gray-100 shadow-sm"><h3 class="font-bold text-sm text-gray-800 mb-3">قائمة الموزعين الحالية</h3><div id="admin-resellers-list" class="space-y-2 max-h-60 overflow-y-auto"></div></div>
-                        <div class="bg-white p-4 rounded-2xl border border-gray-100 shadow-sm"><h3 class="font-bold text-sm text-gray-800 mb-3">قائمة الحزم المضافة</h3><div id="admin-packages-list" class="space-y-2 max-h-60 overflow-y-auto"></div></div>
+                        <div class="bg-white p-4 rounded-2xl border border-gray-100 shadow-sm"><h3 class="font-bold text-sm text-gray-800 mb-3">قائمة الموزعين</h3><div id="admin-resellers-list" class="space-y-2 max-h-60 overflow-y-auto"></div></div>
+                        <div class="bg-white p-4 rounded-2xl border border-gray-100 shadow-sm"><h3 class="font-bold text-sm text-gray-800 mb-3">قائمة الحزم</h3><div id="admin-packages-list" class="space-y-2 max-h-60 overflow-y-auto"></div></div>
                     </div>
                 </div>
             </div>
         </main>
     </div>
 
+    <!-- 3️⃣ لوحة تحكم الموزع -->
     <div id="reseller-page" class="page hidden min-h-screen flex flex-col">
         <header class="bg-white border-b border-gray-100 px-6 py-4 flex justify-between items-center shadow-sm">
             <div class="flex items-center gap-4">
-                <span class="font-bold text-lg text-emerald-600">بوابة الموزعين المعتمدة</span>
+                <span class="font-bold text-lg text-emerald-600">بوابة الموزعين</span>
                 <span class="text-gray-300">|</span>
                 <span class="user-name-display text-gray-600 font-medium text-sm"></span>
                 <div class="bg-emerald-50 text-emerald-700 px-3 py-1 rounded-full text-sm font-bold">
-                    رصيدك المتوفر: <span id="reseller-balance">0.00</span> ₪
+                    رصيدك: <span id="reseller-balance">0.00</span> ₪
                 </div>
             </div>
-            <button onclick="logout()" class="text-red-500 hover:text-red-700 font-bold text-sm flex items-center gap-1"><i class="fa-solid fa-arrow-right-from-bracket"></i> خروج</button>
+            <button onclick="logout()" class="text-red-500 hover:text-red-700 font-bold text-sm flex items-center gap-1 cursor-pointer"><i class="fa-solid fa-arrow-right-from-bracket"></i> خروج</button>
         </header>
 
         <main class="flex-1 p-6 max-w-7xl w-full mx-auto grid grid-cols-1 lg:grid-cols-3 gap-6">
             <div class="lg:col-span-2 space-y-4">
-                <h3 class="font-bold text-gray-800 text-lg"><i class="fa-solid fa-store text-emerald-600 ml-1"></i> العروض والحزم المتاحة للطلب الفوري</h3>
+                <h3 class="font-bold text-gray-800 text-lg"><i class="fa-solid fa-store text-emerald-600 ml-1"></i> العروض المتاحة للطلب الفوري</h3>
                 <div id="reseller-packages-grid" class="grid grid-cols-1 md:grid-cols-2 gap-4"></div>
             </div>
-
             <div class="lg:col-span-1 bg-white p-5 rounded-2xl border border-gray-100 shadow-sm h-fit">
-                <h3 class="font-bold text-gray-800 text-base mb-4"><i class="fa-solid fa-clock-rotate-left text-blue-600 ml-1"></i> آخر عملياتك الحالية</h3>
+                <h3 class="font-bold text-gray-800 text-base mb-4"><i class="fa-solid fa-clock-rotate-left text-blue-600 ml-1"></i> آخر عملياتك</h3>
                 <div class="overflow-x-auto">
                     <table class="w-full text-right table-auto text-xs">
                         <thead>
@@ -513,17 +525,18 @@
         </main>
     </div>
 
+    <!-- مودال لتنفيذ الطلب -->
     <div id="order-modal" class="hidden fixed inset-0 bg-black/50 flex items-center justify-center p-4 z-50">
-        <div class="bg-white rounded-2xl max-w-sm w-full p-6 shadow-2xl animate-in fade-in zoom-in-95 duration-150">
+        <div class="bg-white rounded-2xl max-w-sm w-full p-6 shadow-2xl">
             <h3 class="text-lg font-bold text-gray-900 mb-1">تأكيد طلب الخدمة</h3>
-            <p class="text-sm text-gray-500 mb-4">أنت تطلب الآن: <span id="modal-pkg-name" class="font-bold text-gray-800"></span> بقيمة <span id="modal-pkg-price" class="font-bold text-emerald-600"></span> شيكل</p>
+            <p class="text-sm text-gray-500 mb-4">أنت تطلب: <span id="modal-pkg-name" class="font-bold text-gray-800"></span> بقيمة <span id="modal-pkg-price" class="font-bold text-emerald-600"></span> ₪</p>
             <div class="mb-5">
-                <label class="block text-xs font-semibold text-gray-700 mb-1">أدخل رقم الهاتف المستهدف (جوال أو أوريدو)</label>
+                <label class="block text-xs font-semibold text-gray-700 mb-1">أدخل رقم الهاتف المستهدف</label>
                 <input type="text" id="target-phone" placeholder="059xxxxxxx أو 056xxxxxxx" class="w-full px-4 py-2.5 border rounded-xl text-sm outline-none font-mono focus:border-emerald-500">
             </div>
             <div class="flex gap-2">
-                <button onclick="submitOrder()" class="flex-1 bg-emerald-600 hover:bg-emerald-700 text-white font-semibold text-sm py-2.5 rounded-xl transition-colors">إرسال الطلب الآن</button>
-                <button onclick="closeOrderModal()" class="px-4 bg-gray-100 hover:bg-gray-200 text-gray-600 font-semibold text-sm py-2.5 rounded-xl transition-colors">إلغاء</button>
+                <button onclick="submitOrder()" class="flex-1 bg-emerald-600 hover:bg-emerald-700 text-white font-semibold text-sm py-2.5 rounded-xl cursor-pointer">إرسال الطلب</button>
+                <button onclick="closeOrderModal()" class="px-4 bg-gray-100 hover:bg-gray-200 text-gray-600 font-semibold text-sm py-2.5 rounded-xl cursor-pointer">إلغاء</button>
             </div>
         </div>
     </div>
