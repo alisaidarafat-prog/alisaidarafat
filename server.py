@@ -1,20 +1,16 @@
-"""
-Telecom Reseller Distribution System
-FastAPI + MongoDB backend with JWT auth, WebSockets and Telegram notifications.
-"""
-from fastapi import FastAPI, APIRouter, WebSocket, WebSocketDisconnect, Depends, HTTPException, status
+import os
+from fastapi import FastAPI, HTTPException, Depends, status, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from typing import List, Optional, Dict
-from datetime import datetime, timedelta
-import jose.jwt as jwt
+from typing import List, Optional
+from motor.motor_asyncio import AsyncIOMotorClient
+from bson import ObjectId
 import bcrypt
-import motor.motor_asyncio
-import httpx
-import json
-import os
+import jwt
+from datetime import datetime, timedelta
 
-app = FastAPI(title="Telecom Reseller Distribution System API")
+# إعداد التطبيق
+app = FastAPI(title="Telecom Reseller Distribution System")
 
 app.add_middleware(
     CORSMiddleware,
@@ -24,348 +20,310 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Configuration & Env Setup
-MONGO_URL = "mongodb+srv://alisaidarafat_db_user:OvDxi0IlKNjTMBRI@cluster0.lywo4nm.mongodb.net/?appName=Cluster0"
-DB_NAME = "telecom_db"
-JWT_SECRET = "SuperSecretRandomKey2026ForSecureLoginTokens"
-ALGORITHM = "HS256"
-TELEGRAM_BOT_TOKEN = "8991513968:AAHx33xWvNIZCJogCuIYG-py_Kjb5GvHuoI"
+# الاتصال بقاعدة البيانات (MongoDB Atlas أو محلي)
+MONGO_DETAILS = os.getenv("MONGO_URL", "mongodb+srv://saidarafat:saidarafat7@cluster0.pbg4o.mongodb.net/telecom_db?retryWrites=True&w=majority")
+client = AsyncIOMotorClient(MONGO_DETAILS)
+db = client.get_default_database()
 
-# Native Bcrypt helpers to avoid passlib environment bugs
+JWT_SECRET = os.getenv("JWT_SECRET", "SUPER_SECRET_KEY_123456789_ALISAIDARAFAT")
+ALGORITHM = "HS256"
+
+# دالات التشفير المحدثة لتفادي خطأ الـ 72 حرف
 def hash_password(password: str) -> str:
-    salt = bcrypt.gensalt()
-    return bcrypt.hashpw(password.encode('utf-8'), salt).decode('utf-8')
+    # نقوم بأخذ أول 72 حرف فقط لضمان عدم حدوث ValueError نهائياً
+    pwd_bytes = password.encode('utf-8')[:72]
+    return bcrypt.hashpw(pwd_bytes, bcrypt.gensalt()).decode('utf-8')
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:
     try:
-        return bcrypt.checkpw(plain_password.encode('utf-8'), hashed_password.encode('utf-8'))
+        pwd_bytes = plain_password.encode('utf-8')[:72]
+        return bcrypt.checkpw(pwd_bytes, hashed_password.encode('utf-8'))
     except Exception:
         return False
 
-client = motor.motor_asyncio.AsyncIOMotorClient(MONGO_URL)
-db = client[DB_NAME]
-
-# Collections
-packages_col = db["packages"]
-resellers_col = db["resellers"]
-transactions_col = db["transactions"]
-config_col = db["config"]
-
-# In-memory session trackers
-class ConnectionManager:
-    def __init__(self):
-        self.active_connections: List[WebSocket] = []
-        self.user_connections: Dict[str, List[WebSocket]] = {}
-
-    async def connect(self, websocket: WebSocket, user_id: str = None):
-        await websocket.accept()
-        self.active_connections.append(websocket)
-        if user_id:
-            if user_id not in self.user_connections:
-                self.user_connections[user_id] = []
-            self.user_connections[user_id].append(websocket)
-
-    def disconnect(self, websocket: WebSocket, user_id: str = None):
-        if websocket in self.active_connections:
-            self.active_connections.remove(websocket)
-        if user_id and user_id in self.user_connections:
-            if websocket in self.user_connections[user_id]:
-                self.user_connections[user_id].remove(websocket)
-
-    async def broadcast(self, message: dict):
-        payload = json.dumps(message)
-        for connection in self.active_connections:
-            try:
-                await connection.send_text(payload)
-            except:
-                pass
-
-    async def send_to_user(self, user_id: str, message: dict):
-        if user_id in self.user_connections:
-            payload = json.dumps(message)
-            for connection in self.user_connections[user_id]:
-                try:
-                    await connection.send_text(payload)
-                except:
-                    pass
-
-manager = ConnectionManager()
-
-# Telegram Helper
-async def send_telegram_notification(text: str):
-    try:
-        cfg = await config_col.find_one({"key": "telegram_settings"})
-        if cfg and cfg.get("chat_id"):
-            chat_id = cfg["chat_id"]
-            url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-            async with httpx.AsyncClient() as http_client:
-                await http_client.post(url, json={"chat_id": chat_id, "text": text, "parse_mode": "HTML"})
-    except Exception as e:
-        print(f"Telegram notification failed: {e}")
-
-# Models
-class LoginRequest(BaseModel):
-    username: str
-    password: str
-
-class PackageModel(BaseModel):
-    id: Optional[str] = Field(None, alias="_id")
-    name: str
-    type: str  # 'jawwal' or 'ooredoo'
-    category: str  # 'credit', 'bundle', 'points'
-    cost_price: float
-    sale_price: float
-    description: Optional[str] = ""
-    is_active: bool = True
-
-class ResellerModel(BaseModel):
-    id: Optional[str] = Field(None, alias="_id")
-    username: str
-    password: Optional[str] = None
-    name: str
-    phone: str
-    balance: float = 0.0
-    role: str = "reseller"
-    is_active: bool = True
-
-class BalanceAction(BaseModel):
-    amount: float
-    note: Optional[str] = ""
-
-class OrderRequest(BaseModel):
-    package_id: str
-    target_number: str
-
-# Seed Admin & Config
-@app.on_event("startup")
-async def startup_seed():
-    admin = await resellers_col.find_one({"username": "alisaidarafat"})
-    if not admin:
-        await resellers_col.insert_one({
-            "username": "alisaidarafat",
-            "password": hash_password("alisaidarafat@7"),
-            "name": "علي سعيد عرفات",
-            "phone": "0597111277",
-            "balance": 999999.0,
-            "role": "admin",
-            "is_active": True
-        })
-    cfg = await config_col.find_one({"key": "telegram_settings"})
-    if not cfg:
-        await config_col.insert_one({"key": "telegram_settings", "chat_id": ""})
-
-# Auth Helpers
-def create_access_token(data: dict):
+def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
     to_encode = data.copy()
-    expire = datetime.utcnow() + timedelta(days=7)
+    expire = datetime.utcnow() + (expires_delta or timedelta(days=7))
     to_encode.update({"exp": expire})
     return jwt.encode(to_encode, JWT_SECRET, algorithm=ALGORITHM)
 
+# تحويل كائنات البيانات لتتوافق مع البايرثون
+def pydantic_user(user) -> dict:
+    return {
+        "_id": str(user["_id"]),
+        "username": user["username"],
+        "name": user["name"],
+        "phone": user["phone"],
+        "role": user["role"],
+        "balance": user.get("balance", 0.0),
+        "is_active": user.get("is_active", True)
+    }
+
+# النماذج (Models)
+class LoginModel(BaseModel):
+    username: str
+    password: str
+
+class ResellerCreate(BaseModel):
+    username: str
+    password: str
+    name: str
+    phone: str
+    balance: float = 0.0
+
+class PackageCreate(BaseModel):
+    name: str
+    type: str  # jawwal / ooredoo
+    category: str  # credit / bundle
+    cost_price: float
+    sale_price: float
+    description: Optional[str] = ""
+
+class OrderCreate(BaseModel):
+    package_id: str
+    target_number: str
+
+class BalanceUpdate(BaseModel):
+    amount: float
+    note: Optional[str] = ""
+
+class StatusUpdate(BaseModel):
+    status: str # completed / refunded
+
+# مدير اتصالات WebSocket البث المباشر
+class ConnectionManager:
+    def __init__(self):
+        self.active_connections: List[WebSocket] = []
+
+    async list_connections(self):
+        return self.active_connections
+
+    async connect(self, websocket: WebSocket):
+        await websocket.accept()
+        self.active_connections.append(websocket)
+
+    def disconnect(self, websocket: WebSocket):
+        if websocket in self.active_connections:
+            self.active_connections.remove(websocket)
+
+    async broadcast(self, message: dict):
+        for connection in self.active_connections:
+            try:
+                await connection.send_json(message)
+            except Exception:
+                pass
+
+manager = ConnectionManager()
+
+# التحقق من التوكن للاعتمادية
 async def get_current_user(token: str):
     try:
         payload = jwt.decode(token, JWT_SECRET, algorithms=[ALGORITHM])
         username: str = payload.get("sub")
         if username is None:
-            raise HTTPException(status_code=401, detail="Invalid token")
-        user = await resellers_col.find_one({"username": username})
+            raise HTTPException(status_code=401, detail="توكن غير صالح")
+        user = await db.users.find_one({"username": username})
         if user is None:
-            raise HTTPException(status_code=401, detail="User not found")
-        if "_id" in user:
-            user["_id"] = str(user["_id"])
+            raise HTTPException(status_code=401, detail="المستخدم غير موجود")
         return user
-    except:
-        raise HTTPException(status_code=401, detail="Could not validate credentials")
+    except Exception:
+        raise HTTPException(status_code=401, detail="جلسة غير صالحة أو منتهية")
 
-# Routes
+async def get_admin(token: str):
+    user = await get_current_user(token)
+    if user["role"] != "admin":
+        raise HTTPException(status_code=403, detail="غير مصرح، هذه الصلاحية للمسؤول فقط")
+    return user
+
+# إنشاء حساب أدمن افتراضي عند الإقلاع الفوري للمنظومة
+@app.on_event("startup")
+async def startup_db_client():
+    admin = await db.users.find_one({"username": "alisaidarafat"})
+    if not admin:
+        await db.users.insert_one({
+            "username": "alisaidarafat",
+            "password": hash_password("alisaidarafat@7"),
+            "name": "علي سيد عرفات",
+            "phone": "+972597111277",
+            "role": "admin",
+            "balance": 1000000.0,
+            "is_active": True
+        })
+
+# 1️⃣ مسارات المصادقة
 @app.post("/api/auth/login")
-async def login(req: LoginRequest):
-    user = await resellers_col.find_one({"username": req.username})
-    if not user or not verify_password(req.password, user["password"]):
-        raise HTTPException(status_code=400, detail="اسم المستخدم أو كلمة المرور خاطئة")
+async def login(data: LoginModel):
+    user = await db.users.find_one({"username": data.username.strip()})
+    if not user or not verify_password(data.password, user["password"]):
+        raise HTTPException(status_code=400, detail="اسم المستخدم أو كلمة المرور غير صحيحة")
+    
     token = create_access_token(data={"sub": user["username"]})
-    if "_id" in user:
-        user["_id"] = str(user["_id"])
-    user.pop("password", None)
-    return {"token": token, "user": user}
+    return {"token": token, "user": pydantic_user(user)}
 
-@app.get("/api/admin/stats")
-async def get_stats(user=Depends(get_current_user)):
-    if user["role"] != "admin": raise HTTPException(status_code=403)
-    p_count = await packages_col.count_documents({})
-    r_count = await resellers_col.count_documents({"role": "reseller"})
-    
-    pipeline = [{"$match": {"status": "completed"}}, {"$group": {"_id": None, "total": {"$sum": "$profit"}}}]
-    cursor = transactions_col.aggregate(pipeline)
-    profit_res = await cursor.to_list(length=1)
-    total_profit = profit_res[0]["total"] if profit_res else 0.0
-
-    return {"packages_count": p_count, "resellers_count": r_count, "total_profit": total_profit}
-
-@app.get("/api/admin/packages")
-async def get_packages():
-    pkgs = await packages_col.find({}).to_list(length=500)
-    for p in pkgs: p["_id"] = str(p["_id"])
-    return pkgs
-
-@app.post("/api/admin/packages")
-async def create_package(pkg: PackageModel, user=Depends(get_current_user)):
-    if user["role"] != "admin": raise HTTPException(status_code=403)
-    data = pkg.dict(exclude_none=True)
-    res = await packages_col.insert_one(data)
-    data["_id"] = str(res.inserted_id)
-    return data
-
-@app.patch("/api/admin/packages/{pkg_id}")
-async def update_package(pkg_id: str, pkg: PackageModel, user=Depends(get_current_user)):
-    if user["role"] != "admin": raise HTTPException(status_code=403)
-    from bson import ObjectId
-    await packages_col.update_one({"_id": ObjectId(pkg_id)}, {"$set": pkg.dict(exclude_unset=True, exclude_none=True)})
-    return {"status": "success"}
-
-@app.delete("/api/admin/packages/{pkg_id}")
-async def delete_package(pkg_id: str, user=Depends(get_current_user)):
-    if user["role"] != "admin": raise HTTPException(status_code=403)
-    from bson import ObjectId
-    await packages_col.delete_one({"_id": ObjectId(pkg_id)})
-    return {"status": "success"}
-
-@app.get("/api/admin/resellers")
-async def get_resellers(user=Depends(get_current_user)):
-    if user["role"] != "admin": raise HTTPException(status_code=403)
-    resellers = await resellers_col.find({"role": "reseller"}).to_list(length=500)
-    for r in resellers:
-        r["_id"] = str(r["_id"])
-        r.pop("password", None)
-    return resellers
-
-@app.post("/api/admin/resellers")
-async def create_reseller(reseller: ResellerModel, user=Depends(get_current_user)):
-    if user["role"] != "admin": raise HTTPException(status_code=403)
-    data = reseller.dict()
-    data["password"] = hash_password(data["password"] or "123456")
-    try:
-        res = await resellers_col.insert_one(data)
-        data["_id"] = str(res.inserted_id)
-        data.pop("password", None)
-        return data
-    except:
-        raise HTTPException(status_code=400, detail="اسم المستخدم موجود بالفعل")
-
-@app.post("/api/admin/resellers/{r_id}/balance")
-async def manage_balance(r_id: str, action: BalanceAction, user=Depends(get_current_user)):
-    if user["role"] != "admin": raise HTTPException(status_code=403)
-    from bson import ObjectId
-    reseller = await resellers_col.find_one({"_id": ObjectId(r_id)})
-    if not reseller: raise HTTPException(status_code=404)
-    
-    new_balance = reseller["balance"] + action.amount
-    await resellers_col.update_one({"_id": ObjectId(r_id)}, {"$set": {"balance": new_balance}})
-    
-    await transactions_col.insert_one({
-        "reseller_id": r_id,
-        "reseller_name": reseller["name"],
-        "type": "deposit" if action.amount > 0 else "withdrawal",
-        "details": f"تعديل رصيد من قبل الإدارة: {action.note}",
-        "amount": abs(action.amount),
-        "target": reseller["phone"],
-        "status": "completed",
-        "profit": 0.0,
-        "timestamp": datetime.utcnow().isoformat()
-    })
-    return {"status": "success", "new_balance": new_balance}
-
-@app.post("/api/reseller/order")
-async def place_order(req: OrderRequest, token: str):
-    user = await get_current_user(token)
-    from bson import ObjectId
-    package = await packages_col.find_one({"_id": ObjectId(req.package_id)})
-    if not package or not package["is_active"]:
-        raise HTTPException(status_code=400, detail="الحزمة غير متوفرة حالياً")
-    
-    if user["balance"] < package["sale_price"]:
-        raise HTTPException(status_code=400, detail="رصيدك غير كافٍ لإتمام العملية")
-    
-    # Deduct balance
-    new_balance = user["balance"] - package["sale_price"]
-    await resellers_col.update_one({"_id": ObjectId(user["_id"])}, {"$set": {"balance": new_balance}})
-    
-    profit = package["sale_price"] - package["cost_price"]
-    tx = {
-        "reseller_id": user["_id"],
-        "reseller_name": user["name"],
-        "type": "order",
-        "details": f"{package['name']} ({package['category']})",
-        "amount": package["sale_price"],
-        "target": req.target_number,
-        "status": "pending",
-        "profit": profit,
-        "timestamp": datetime.utcnow().isoformat()
-    }
-    res = await transactions_col.insert_one(tx)
-    tx["_id"] = str(res.inserted_id)
-    
-    # Notify Admin via Telegram & WebSocket
-    await manager.broadcast({"event": "new_order", "data": tx})
-    msg = f"🔔 <b>طلب جديد قيد الانتظار!</b>\n\n• الموزع: {user['name']}\n• العملية: {package['name']}\n• الرقم المستهدف: <code>{req.target_number}</code>\n• القيمة: {package['sale_price']} شيكل"
-    await send_telegram_notification(msg)
-    
-    return {"status": "pending", "tx_id": tx["_id"], "new_balance": new_balance}
-
-@app.get("/api/transactions")
-async def get_transactions(token: str):
-    user = await get_current_user(token)
-    query = {} if user["role"] == "admin" else {"reseller_id": user["_id"]}
-    txs = await transactions_col.find(query).sort("timestamp", -1).to_list(length=1000)
-    for t in txs: t["_id"] = str(t["_id"])
-    return txs
-
-@app.post("/api/admin/transactions/{tx_id}/status")
-async def update_tx_status(tx_id: str, payload: dict, user=Depends(get_current_user)):
-    if user["role"] != "admin": raise HTTPException(status_code=403)
-    from bson import ObjectId
-    new_status = payload.get("status")  # 'completed' or 'refunded'
-    tx = await transactions_col.find_one({"_id": ObjectId(tx_id)})
-    if not tx or tx["status"] != "pending":
-        raise HTTPException(status_code=400, detail="الطلب ليس معلقاً أو غير موجود")
-    
-    await transactions_col.update_one({"_id": ObjectId(tx_id)}, {"$set": {"status": new_status}})
-    tx["status"] = new_status
-    
-    if new_status == "refunded":
-        # Refund balance to reseller
-        reseller = await resellers_col.find_one({"_id": ObjectId(tx["reseller_id"])})
-        if reseller:
-            await resellers_col.update_one({"_id": ObjectId(tx["reseller_id"])}, {"$set": {"balance": reseller["balance"] + tx["amount"]}})
-    
-    await manager.broadcast({"event": "status_updated", "data": tx})
-    await manager.send_to_user(tx["reseller_id"], {"event": "order_update", "data": tx})
-    
-    status_text = "✅ تم التنفيذ بنجاح" if new_status == "completed" else "❌ تم الرفض وإرجاع الرصيد"
-    msg = f"📢 <b>تحديث حالة الطلب</b>\n\n• العملية: {tx['details']}\n• الرقم: {tx['target']}\n• الحالة الجديدة: <b>{status_text}</b>"
-    await send_telegram_notification(msg)
-    
-    return {"status": "success"}
-
-@app.post("/api/admin/telegram-config")
-async def set_telegram_config(payload: dict, user=Depends(get_current_user)):
-    if user["role"] != "admin": raise HTTPException(status_code=403)
-    chat_id = payload.get("chat_id", "").strip()
-    await config_col.update_one({"key": "telegram_settings"}, {"$set": {"chat_id": chat_id}}, upsert=True)
-    return {"status": "success"}
-
+# WebSocket للمزامنة الفورية الجارية
 @app.websocket("/ws")
-async def websocket_endpoint(websocket: WebSocket, token: Optional[str] = None):
-    user_id = None
-    if token:
-        try:
-            payload = jwt.decode(token, JWT_SECRET, algorithms=[ALGORITHM])
-            user = await resellers_col.find_one({"username": payload.get("sub")})
-            if user: user_id = str(user["_id"])
-        except:
-            pass
-    await manager.connect(websocket, user_id)
+async def websocket_endpoint(websocket: WebSocket, token: str):
+    await manager.connect(websocket)
     try:
         while True:
             await websocket.receive_text()
     except WebSocketDisconnect:
-        manager.disconnect(websocket, user_id)
+        manager.disconnect(websocket)
+
+# 2️⃣ مسارات الإدارة (الأدمن)
+@app.post("/api/admin/resellers")
+async def create_reseller(data: ResellerCreate, token: str = Depends(get_admin)):
+    existing = await db.users.find_one({"username": data.username.strip()})
+    if existing:
+        raise HTTPException(status_code=400, detail="اسم المستخدم هذا مسجل مسبقاً في النظام")
+    
+    reseller = {
+        "username": data.username.strip(),
+        "password": hash_password(data.password),
+        "name": data.name,
+        "phone": data.phone,
+        "role": "reseller",
+        "balance": data.balance,
+        "is_active": True
+    }
+    result = await db.users.insert_one(reseller)
+    reseller["_id"] = str(result.inserted_id)
+    await manager.broadcast({"event": "reseller_created", "data": {"name": data.name}})
+    return {"status": "success", "id": reseller["_id"]}
+
+@app.get("/api/admin/resellers")
+async def get_resellers(token: str = Depends(get_admin)):
+    resellers = await db.users.find({"role": "reseller"}).to_list(1000)
+    return [pydantic_user(r) for r in resellers]
+
+@app.post("/api/admin/resellers/{r_id}/balance")
+async def update_reseller_balance(r_id: str, data: BalanceUpdate, token: str = Depends(get_admin)):
+    user = await db.users.find_one({"_id": ObjectId(r_id)})
+    if not user:
+        raise HTTPException(status_code=404, detail="الموزع غير موجود")
+    
+    new_balance = user.get("balance", 0.0) + data.amount
+    await db.users.update_one({"_id": ObjectId(r_id)}, {"$set": {"balance": new_balance}})
+    
+    # تسجيل حركة شحن الرصيد في العمليات
+    await db.transactions.insert_one({
+        "reseller_id": r_id,
+        "reseller_name": user["name"],
+        "type": "deposit" if data.amount > 0 else "withdrawal",
+        "details": f"شحن رصيد مباشر من الإدارة: {data.note}",
+        "target": "-",
+        "amount": abs(data.amount),
+        "status": "completed",
+        "timestamp": datetime.utcnow().isoformat()
+    })
+    
+    await manager.broadcast({"event": "order_update", "data": {"reseller_id": r_id}})
+    return {"status": "success", "new_balance": new_balance}
+
+@app.post("/api/admin/packages")
+async def create_package(data: PackageCreate, token: str = Depends(get_admin)):
+    package = data.dict()
+    package["is_active"] = True
+    result = await db.packages.insert_one(package)
+    return {"status": "success", "id": str(result.inserted_id)}
+
+@app.get("/api/admin/packages")
+async def get_packages():
+    pkgs = await db.packages.find().to_list(1000)
+    for p in pkgs:
+        p["_id"] = str(p["_id"])
+    return pkgs
+
+@app.get("/api/admin/stats")
+async def get_stats(token: str = Depends(get_admin)):
+    r_count = await db.users.count_documents({"role": "reseller"})
+    p_count = await db.packages.count_documents({})
+    
+    # حساب الأرباح التقريبية من الطلبات المكتملة
+    pipeline = [
+        {"$match": {"status": "completed", "type": "order"}},
+        {"$group": {"_id": None, "total": {"$sum": "$profit"}}}
+    ]
+    cursor = db.transactions.aggregate(pipeline)
+    result = await cursor.to_list(1)
+    profit = result[0]["total"] if result else 0.0
+    
+    return {
+        "resellers_count": r_count,
+        "packages_count": p_count,
+        "total_profit": profit
+    }
+
+# 3️⃣ مسارات الموزع والعمليات المشتركة
+@app.post("/api/reseller/order")
+async def place_order(data: OrderCreate, token: str = Depends(get_current_user)):
+    if token["role"] != "reseller":
+        raise HTTPException(status_code=403, detail="فقط الموزعين يمكنهم إرسال طلبات")
+    
+    package = await db.packages.find_one({"_id": ObjectId(data.package_id)})
+    if not package or not package.get("is_active", True):
+        raise HTTPException(status_code=404, detail="الحزمة أو العرض المطلوب غير متوفر حالياً")
+    
+    cost = package["sale_price"]
+    if token.get("balance", 0.0) < cost:
+        raise HTTPException(status_code=400, detail="رصيدك الحالي غير كافٍ لإتمام هذا الطلب")
+    
+    # خصم مؤقت للرصيد
+    new_balance = token["balance"] - cost
+    await db.users.update_one({"_id": token["_id"]}, {"$set": {"balance": new_balance}})
+    
+    profit = package["sale_price"] - package["cost_price"]
+    
+    order_tx = {
+        "reseller_id": str(token["_id"]),
+        "reseller_name": token["name"],
+        "type": "order",
+        "package_id": data.package_id,
+        "details": package["name"],
+        "target": data.target_number,
+        "amount": cost,
+        "profit": profit,
+        "status": "pending",
+        "timestamp": datetime.utcnow().isoformat()
+    }
+    await db.transactions.insert_one(order_tx)
+    await manager.broadcast({"event": "new_order", "data": order_tx})
+    
+    return {"status": "success", "new_balance": new_balance}
+
+@app.get("/api/transactions")
+async def get_transactions(token: str = Depends(get_current_user)):
+    if token["role"] == "admin":
+        txs = await db.transactions.find().sort("timestamp", -1).to_list(1000)
+    else:
+        txs = await db.transactions.find({"reseller_id": str(token["_id"])}).sort("timestamp", -1).to_list(1000)
+        
+    for t in txs:
+        t["_id"] = str(t["_id"])
+    return txs
+
+@app.post("/api/admin/transactions/{tx_id}/status")
+async def change_transaction_status(tx_id: str, data: StatusUpdate, token: str = Depends(get_admin)):
+    tx = await db.transactions.find_one({"_id": ObjectId(tx_id)})
+    if not tx:
+        raise HTTPException(status_code=404, detail="المعاملة غير موجودة")
+        
+    if tx["status"] != "pending":
+        raise HTTPException(status_code=400, detail="تم تحديث حالة هذه المعاملة مسبقاً")
+        
+    await db.transactions.update_one({"_id": ObjectId(tx_id)}, {"$set": {"status": data.status}})
+    
+    # إعادة الرصيد للموزع إذا تم رفض الطلب (refunded)
+    if data.status == "refunded" and tx["type"] == "order":
+        reseller = await db.users.find_one({"_id": ObjectId(tx["reseller_id"])})
+        if reseller:
+            refunded_balance = reseller.get("balance", 0.0) + tx["amount"]
+            await db.users.update_one({"_id": ObjectId(tx["reseller_id"])}, {"$set": {"balance": refunded_balance}})
+            
+    await manager.broadcast({"event": "status_updated", "data": {"tx_id": tx_id, "status": data.status, "reseller_id": tx["reseller_id"]}})
+    return {"status": "success"}
+
+@app.post("/api/admin/telegram-config")
+async def config_telegram(data: dict, token: str = Depends(get_admin)):
+    await db.config.update_one({"key": "telegram"}, {"$set": {"chat_id": data.get("chat_id")}}, upsert=True)
+    return {"status": "success"}
