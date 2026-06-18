@@ -1,0 +1,401 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>نظام توزيع الاتصالات - لوحة التحكم</title>
+    <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Cairo:wght@300;400;600;700&display=swap');
+        body { font-family: 'Cairo', sans-serif; }
+    </style>
+</head>
+<body class="bg-gray-50 text-gray-800">
+    <script>
+        // الرابط الخاص بك المربوط بالسيرفر المباشر
+        const API_BASE_URL = "https://alisaidarafat.onrender.com";
+        let ws;
+
+        window.onload = function() {
+            const token = localStorage.getItem("token");
+            const user = JSON.parse(localStorage.getItem("user"));
+            if (!token || !user) {
+                showPage("login-page");
+            } else {
+                initDashboard(user);
+            }
+        }
+
+        function showPage(pageId) {
+            document.querySelectorAll('.page').forEach(p => p.classList.add('hidden'));
+            document.getElementById(pageId).classList.remove('hidden');
+        }
+
+        // تسجيل الدخول
+        async function handleLogin(e) {
+            e.preventDefault();
+            const username = document.getElementById("username").value;
+            const password = document.getElementById("password").value;
+            const errorDiv = document.getElementById("login-error");
+            
+            try {
+                const response = await fetch(`${API_BASE_URL}/api/auth/login`, {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ username, password })
+                });
+                
+                const data = await response.json();
+                if (!response.ok) throw new Error(data.detail || "فشل تسجيل الدخول");
+                
+                localStorage.setItem("token", data.token);
+                localStorage.setItem("user", JSON.stringify(data.user));
+                initDashboard(data.user);
+            } catch (err) {
+                errorDiv.classList.remove("hidden");
+                errorDiv.innerText = err.message;
+            }
+        }
+
+        function logout() {
+            if(ws) ws.close();
+            localStorage.clear();
+            location.reload();
+        }
+
+        function initDashboard(user) {
+            document.querySelectorAll(".user-name-display").forEach(el => el.innerText = user.name);
+            setupWebSocket();
+            
+            if (user.role === "admin") {
+                showPage("admin-page");
+                loadAdminStats();
+                loadAdminPackages();
+                loadAdminResellers();
+                loadTransactions();
+            } else {
+                showPage("reseller-page");
+                document.getElementById("reseller-balance").innerText = user.balance.toFixed(2);
+                loadResellerPackages();
+                loadTransactions();
+            }
+        }
+
+        function setupWebSocket() {
+            const token = localStorage.getItem("token");
+            const wsProto = location.protocol === "https:" ? "wss:" : "ws:";
+            const wsUrl = API_BASE_URL.replace(/^https?:\/\//, "");
+            ws = new WebSocket(`${wsProto}//${wsUrl}/ws?token=${token}`);
+            
+            ws.onmessage = function(event) {
+                const msg = JSON.parse(event.data);
+                if (msg.event === "new_order" || msg.event === "status_updated" || msg.event === "order_update") {
+                    const user = JSON.parse(localStorage.getItem("user"));
+                    if(user.role === 'admin') {
+                        loadAdminStats();
+                        loadTransactions();
+                    } else {
+                        // تحديث رصيد الموزع إذا تغيرت الحالة
+                        if(msg.data.reseller_id === user._id) {
+                            refreshResellerBalance();
+                            loadTransactions();
+                        }
+                    }
+                }
+            };
+        }
+
+        async function refreshResellerBalance() {
+            // تحديث سريع للرصيد عبر تسجيل دخول صامت أو تحديث من المعاملات
+            loadTransactions();
+        }
+
+        // دالة جلب إحصائيات الأدمن
+        async function loadAdminStats() {
+            const token = localStorage.getItem("token");
+            try {
+                const res = await fetch(`${API_BASE_URL}/api/admin/stats`, {
+                    headers: { "Authorization": `Bearer ${token}` }
+                });
+                const stats = await res.json();
+                document.getElementById("stat-resellers").innerText = stats.resellers_count;
+                document.getElementById("stat-packages").innerText = stats.packages_count;
+                document.getElementById("stat-profit").innerText = stats.total_profit.toFixed(2) + " شيكل";
+            } catch (err) { console.error(err); }
+        }
+
+        // جلب الحزم للأدمن
+        async function loadAdminPackages() {
+            try {
+                const res = await fetch(`${API_BASE_URL}/api/admin/packages`);
+                const pkgs = await res.json();
+                const container = document.getElementById("admin-packages-list");
+                container.innerHTML = pkgs.map(p => `
+                    <div class="bg-gray-50 p-4 rounded-xl border border-gray-200 flex justify-between items-center">
+                        <div>
+                            <h4 class="font-bold text-gray-800">${p.name}</h4>
+                            <p class="text-xs text-gray-500">التكلفة: ${p.cost_price} | البيع: ${p.sale_price} شيكل</p>
+                        </div>
+                        <span class="px-2 py-1 text-xs rounded-lg font-bold ${p.type === 'jawwal' ? 'bg-orange-100 text-orange-700':'bg-blue-100 text-blue-700'}">${p.type.toUpperCase()}</span>
+                    </div>
+                `).join('');
+            } catch (err) { console.error(err); }
+        }
+
+        // إضافة حزمة جديدة
+        async function addPackage(e) {
+            e.preventDefault();
+            const token = localStorage.getItem("token");
+            const body = {
+                name: document.getElementById("p-name").value,
+                type: document.getElementById("p-type").value,
+                category: document.getElementById("p-cat").value,
+                cost_price: parseFloat(document.getElementById("p-cost").value),
+                sale_price: parseFloat(document.getElementById("p-sale").value),
+                description: ""
+            };
+            await fetch(`${API_BASE_URL}/api/admin/packages`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json", "Authorization": `Bearer ${token}` },
+                body: JSON.stringify(body)
+            });
+            document.getElementById("pkg-form").reset();
+            loadAdminStats();
+            loadAdminPackages();
+        }
+
+        // جلب الموزعين للأدمن
+        async function loadAdminResellers() {
+            const token = localStorage.getItem("token");
+            try {
+                const res = await fetch(`${API_BASE_URL}/api/admin/resellers`, {
+                    headers: { "Authorization": `Bearer ${token}` }
+                });
+                const resellers = await res.json();
+                const select = document.getElementById("r-select-balance");
+                if(select) {
+                    select.innerHTML = '<option value="">اختر موزع لتعديل رصيده...</option>' + resellers.map(r => `<option value="${r._id}">${r.name} (${r.balance} شيكل)</option>`).join('');
+                }
+                const container = document.getElementById("admin-resellers-list");
+                container.innerHTML = resellers.map(r => `
+                    <div class="bg-gray-50 p-4 rounded-xl border border-gray-200 flex justify-between items-center">
+                        <div>
+                            <h4 class="font-bold text-gray-800">${r.name}</h4>
+                            <p class="text-xs text-gray-500">حساب: ${r.username} | هاتف: ${r.phone}</p>
+                        </div>
+                        <span class="bg-emerald-100 text-emerald-800 font-bold px-3 py-1 rounded-full text-sm">${r.balance.toFixed(2)} شيكل</span>
+                    </div>
+                `).join('');
+            } catch (err) { console.error(err); }
+        }
+
+        // إضافة موزع جديد
+        async function addReseller(e) {
+            e.preventDefault();
+            const token = localStorage.getItem("token");
+            const body = {
+                username: document.getElementById("r-user").value,
+                password: document.getElementById("r-pass").value,
+                name: document.getElementById("r-name").value,
+                phone: document.getElementById("r-phone").value,
+                balance: parseFloat(document.getElementById("r-balance").value || 0)
+            };
+            const res = await fetch(`${API_BASE_URL}/api/admin/resellers`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json", "Authorization": `Bearer ${token}` },
+                body: JSON.stringify(body)
+            });
+            if(res.ok) {
+                document.getElementById("reseller-form").reset();
+                loadAdminStats();
+                loadAdminResellers();
+            } else {
+                alert("اسم المستخدم موجود مسبقاً");
+            }
+        }
+
+        // شحن رصيد للموزع
+        async function updateBalance(e) {
+            e.preventDefault();
+            const token = localStorage.getItem("token");
+            const rId = document.getElementById("r-select-balance").value;
+            const amount = parseFloat(document.getElementById("b-amount").value);
+            if(!rId) return;
+            
+            await fetch(`${API_BASE_URL}/api/admin/resellers/${rId}/balance`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json", "Authorization": `Bearer ${token}` },
+                body: JSON.stringify({ amount, note: "تعديل رصيد مباشر" })
+            });
+            document.getElementById("balance-form").reset();
+            loadAdminResellers();
+        }
+
+        // جلب العمليات والطلبات للجميع
+        async function loadTransactions() {
+            const token = localStorage.getItem("token");
+            const user = JSON.parse(localStorage.getItem("user"));
+            try {
+                const res = await fetch(`${API_BASE_URL}/api/transactions?token=${token}`);
+                const txs = await res.json();
+                
+                const tableBody = user.role === 'admin' ? document.getElementById("admin-tx-table") : document.getElementById("reseller-tx-table");
+                if(!tableBody) return;
+
+                tableBody.innerHTML = txs.map(t => {
+                    let statusBadge = '';
+                    if(t.status === 'pending') statusBadge = `<span class="bg-amber-100 text-amber-700 px-2 py-1 rounded text-xs font-bold">معلق</span>`;
+                    else if(t.status === 'completed') statusBadge = `<span class="bg-green-100 text-green-700 px-2 py-1 rounded text-xs font-bold">تم التنفيذ</span>`;
+                    else statusBadge = `<span class="bg-red-100 text-red-700 px-2 py-1 rounded text-xs font-bold">مرفوض</span>`;
+
+                    let actionBtn = '';
+                    if(user.role === 'admin' && t.status === 'pending') {
+                        actionBtn = `
+                            <div class="flex gap-1 mt-1">
+                                <button onclick="changeTxStatus('${t._id}', 'completed')" class="bg-green-500 hover:bg-green-600 text-white text-xs px-2 py-1 rounded transition-colors">قبول</button>
+                                <button onclick="changeTxStatus('${t._id}', 'refunded')" class="bg-red-500 hover:bg-red-600 text-white text-xs px-2 py-1 rounded transition-colors">رفض</button>
+                            </div>
+                        `;
+                    }
+
+                    return `
+                        <tr class="border-b border-gray-100 hover:bg-gray-50 text-sm">
+                            <td class="p-3 text-right">${t.reseller_name}</td>
+                            <td class="p-3 text-right font-medium">${t.details}</td>
+                            <td class="p-3 text-right font-mono">${t.target}</td>
+                            <td class="p-3 text-right font-bold text-blue-600">${t.amount} شيكل</td>
+                            <td class="p-3 text-right">${statusBadge} ${actionBtn}</td>
+                        </tr>
+                    `;
+                }).join('');
+            } catch (err) { console.error(err); }
+        }
+
+        async function changeTxStatus(txId, status) {
+            const token = localStorage.getItem("token");
+            await fetch(`${API_BASE_URL}/api/admin/transactions/${txId}/status`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json", "Authorization": `Bearer ${token}` },
+                body: JSON.stringify({ status })
+            });
+            loadAdminStats();
+            loadTransactions();
+        }
+
+        // جلب الحزم للموزع لشراءها
+        async function loadResellerPackages() {
+            try {
+                const res = await fetch(`${API_BASE_URL}/api/admin/packages`);
+                const pkgs = await res.json();
+                const container = document.getElementById("reseller-packages-grid");
+                container.innerHTML = pkgs.filter(p => p.is_active).map(p => `
+                    <div class="bg-white p-5 rounded-2xl shadow-sm border border-gray-100 flex flex-col justify-between">
+                        <div class="flex justify-between items-start mb-3">
+                            <span class="px-2 py-1 text-xs rounded-lg font-bold ${p.type === 'jawwal' ? 'bg-orange-100 text-orange-700':'bg-blue-100 text-blue-700'}">${p.type.toUpperCase()}</span>
+                            <span class="text-xs text-gray-400 font-medium">${p.category}</span>
+                        </div>
+                        <h4 class="font-bold text-gray-800 text-base mb-4">${p.name}</h4>
+                        <div class="flex justify-between items-center mt-auto">
+                            <span class="text-lg font-bold text-emerald-600">${p.sale_price} ₪</span>
+                            <button onclick="openOrderModal('${p._id}', '${p.name}', ${p.sale_price})" class="bg-emerald-600 hover:bg-emerald-700 text-white font-semibold text-xs px-4 py-2 rounded-xl transition-colors">طلب الآن</button>
+                        </div>
+                    </div>
+                `).join('');
+            } catch (err) { console.error(err); }
+        }
+
+        let currentSelectedPkgId = null;
+        function openOrderModal(id, name, price) {
+            currentSelectedPkgId = id;
+            document.getElementById("modal-pkg-name").innerText = name;
+            document.getElementById("modal-pkg-price").innerText = price;
+            document.getElementById("order-modal").classList.remove("hidden");
+        }
+        function closeOrderModal() {
+            document.getElementById("order-modal").classList.add("hidden");
+            document.getElementById("target-phone").value = '';
+        }
+
+        async function submitOrder() {
+            const token = localStorage.getItem("token");
+            const target = document.getElementById("target-phone").value;
+            if(!target) return alert("الرجاء إدخال رقم الهاتف");
+            
+            const res = await fetch(`${API_BASE_URL}/api/reseller/order?token=${token}`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ package_id: currentSelectedPkgId, target_number: target })
+            });
+            const data = await res.json();
+            if(res.ok) {
+                alert("تم إرسال طلبك بنجاح وهو قيد التنفيذ الآن!");
+                document.getElementById("reseller-balance").innerText = data.new_balance.toFixed(2);
+                closeOrderModal();
+                loadTransactions();
+            } else {
+                alert(data.detail || "حدث خطأ أثناء الطلب");
+            }
+        }
+
+        // إعداد التلغرام للأدمن
+        async function saveTelegramConfig(e) {
+            e.preventDefault();
+            const token = localStorage.getItem("token");
+            const chatId = document.getElementById("tele-chat-id").value;
+            await fetch(`${API_BASE_URL}/api/admin/telegram-config`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json", "Authorization": `Bearer ${token}` },
+                body: JSON.stringify({ chat_id: chatId })
+            });
+            alert("تم حفظ معرف Telegram بنجاح!");
+        }
+    </script>
+
+    <div id="login-page" class="page min-h-screen flex items-center justify-center px-4">
+        <div class="max-w-md w-full bg-white rounded-2xl shadow-xl p-8 border border-gray-100">
+            <div class="text-center mb-8">
+                <div class="w-16 h-16 bg-blue-600 rounded-full flex items-center justify-center mx-auto mb-4 shadow-lg">
+                    <i class="fa-solid fa-bolt text-white text-2xl"></i>
+                </div>
+                <h2 class="text-2xl font-bold text-gray-900">تسجيل الدخول للنظام</h2>
+                <p class="text-gray-500 text-sm mt-1">ادخل اسم المستخدم وكلمة المرور الخاصة بحسابك</p>
+            </div>
+            <div id="login-error" class="hidden bg-red-50 text-red-600 text-sm p-3 rounded-lg mb-4 text-center border border-red-100"></div>
+            <form onsubmit="handleLogin(event)" class="space-y-5">
+                <div>
+                    <label class="block text-sm font-semibold text-gray-700 mb-1">اسم المستخدم</label>
+                    <input type="text" id="username" required class="w-full px-4 py-2.5 rounded-xl border border-gray-200 outline-none focus:border-blue-500">
+                </div>
+                <div>
+                    <label class="block text-sm font-semibold text-gray-700 mb-1">كلمة المرور</label>
+                    <input type="password" id="password" required class="w-full px-4 py-2.5 rounded-xl border border-gray-200 outline-none focus:border-blue-500">
+                </div>
+                <button type="submit" class="w-full bg-blue-600 hover:bg-blue-700 text-white font-semibold py-3 rounded-xl transition-all shadow-lg">دخول</button>
+            </form>
+        </div>
+    </div>
+
+    <div id="admin-page" class="page hidden min-h-screen flex flex-col">
+        <header class="bg-white border-b border-gray-100 px-6 py-4 flex justify-between items-center shadow-sm">
+            <div class="flex items-center gap-3">
+                <span class="font-bold text-lg text-blue-600">لوحة الإدارة الرئيسية</span>
+                <span class="text-gray-300">|</span>
+                <span class="user-name-display text-gray-600 font-medium text-sm"></span>
+            </div>
+            <button onclick="logout()" class="text-red-500 hover:text-red-700 font-bold text-sm flex items-center gap-1"><i class="fa-solid fa-arrow-right-from-bracket"></i> خروج</button>
+        </header>
+
+        <main class="flex-1 p-6 max-w-7xl w-full mx-auto space-y-6">
+            <div class="grid grid-cols-1 md:grid-cols-3 gap-6">
+                <div class="bg-white p-6 rounded-2xl border border-gray-100 flex justify-between items-center shadow-sm">
+                    <div><p class="text-gray-400 text-xs">الموزعين</p><h3 id="stat-resellers" class="text-2xl font-bold text-gray-800">0</h3></div>
+                    <div class="w-10 h-10 bg-blue-50 text-blue-600 rounded-xl flex items-center justify-center text-lg"><i class="fa-solid fa-users"></i></div>
+                </div>
+                <div class="bg-white p-6 rounded-2xl border border-gray-100 flex justify-between items-center shadow-sm">
+                    <div><p class="text-gray-400 text-xs">الحزم والإقامات</p><h3 id="stat-packages" class="text-2xl font-bold text-gray-800">0</h3></div>
+                    <div class="w-10 h-10 bg-green-50 text-green-600 rounded-xl flex items-center justify-center text-lg"><i class="fa-solid fa-box"></i></div>
+                </div>
+                <div class="bg-white p-6 rounded-2xl border border-gray-100 flex justify-between items-center shadow-sm">
+                    <div><p class="text-gray-400 text-xs">أرباح النظام</p><h3 id="stat-profit" class="text-2xl font-bold text-gray-800">0 ₪</h3></div>
+                    <div class="w-10 h-10 bg-amber-
