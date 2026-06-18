@@ -12,6 +12,7 @@ from datetime import datetime, timedelta
 # إعداد تطبيق FastAPI
 app = FastAPI(title="Telecom Reseller Distribution System")
 
+# تفعيل الـ CORS لتسريع وتسهيل اتصال الواجهة بالسيرفر
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -20,7 +21,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# الاتصال بقاعدة البيانات
+# الاتصال بقاعدة البيانات MongoDB Atlas
 MONGO_DETAILS = os.getenv("MONGO_URL", "mongodb+srv://saidarafat:saidarafat7@cluster0.pbg4o.mongodb.net/telecom_db?retryWrites=True&w=majority")
 client = AsyncIOMotorClient(MONGO_DETAILS)
 db = client.get_default_database()
@@ -28,7 +29,7 @@ db = client.get_default_database()
 JWT_SECRET = os.getenv("JWT_SECRET", "SUPER_SECRET_KEY_123456789_ALISAIDARAFAT")
 ALGORITHM = "HS256"
 
-# دالات التشفير
+# دالات التشفير والتحقق الحديثة لتفادي أخطاء الـ 72 حرف (bcrypt)
 def hash_password(password: str) -> str:
     pwd_bytes = password.encode('utf-8')[:72]
     return bcrypt.hashpw(pwd_bytes, bcrypt.gensalt()).decode('utf-8')
@@ -57,7 +58,7 @@ def pydantic_user(user) -> dict:
         "is_active": user.get("is_active", True)
     }
 
-# النماذج (Models)
+# نماذج البيانات الحديثة (Pydantic v2 Models)
 class LoginModel(BaseModel):
     username: str
     password: str
@@ -88,7 +89,7 @@ class BalanceUpdate(BaseModel):
 class StatusUpdate(BaseModel):
     status: str
 
-# مدير اتصالات WebSocket
+# مدير اتصالات البث المباشر WebSocket
 class ConnectionManager:
     def __init__(self):
         self.active_connections: List[WebSocket] = []
@@ -110,7 +111,7 @@ class ConnectionManager:
 
 manager = ConnectionManager()
 
-# التحقق من التوكن
+# التحقق من صلاحيات وجلسات المستخدمين والـ Admin
 async def get_current_user(token: str):
     try:
         payload = jwt.decode(token, JWT_SECRET, algorithms=[ALGORITHM])
@@ -127,10 +128,10 @@ async def get_current_user(token: str):
 async def get_admin(token: str):
     user = await get_current_user(token)
     if user["role"] != "admin":
-        raise HTTPException(status_code=403, detail="غير مصرح")
+        raise HTTPException(status_code=403, detail="غير مصرح، الصلاحية للمسؤول فقط")
     return user
 
-# عند الإقلاع
+# إنشاء حساب الأدمن الافتراضي تلقائياً عند تشغيل السيرفر لأول مرة
 @app.on_event("startup")
 async def startup_db_client():
     admin = await db.users.find_one({"username": "alisaidarafat"})
@@ -145,7 +146,7 @@ async def startup_db_client():
             "is_active": True
         })
 
-# مسارات المصادقة
+# 1️⃣ مسارات تسجيل الدخول والمصادقة
 @app.post("/api/auth/login")
 async def login(data: LoginModel):
     user = await db.users.find_one({"username": data.username.strip()})
@@ -164,12 +165,12 @@ async def websocket_endpoint(websocket: WebSocket, token: str):
     except WebSocketDisconnect:
         manager.disconnect(websocket)
 
-# مسارات الإدارة
+# 2️⃣ مسارات الإدارة والتحكم (الأدمن)
 @app.post("/api/admin/resellers")
 async def create_reseller(data: ResellerCreate, token: str = Depends(get_admin)):
     existing = await db.users.find_one({"username": data.username.strip()})
     if existing:
-        raise HTTPException(status_code=400, detail="اسم المستخدم مسجل مسبقاً")
+        raise HTTPException(status_code=400, detail="اسم المستخدم مسجل مسبقاً في النظام")
     
     reseller = {
         "username": data.username.strip(),
@@ -213,7 +214,8 @@ async def update_reseller_balance(r_id: str, data: BalanceUpdate, token: str = D
 
 @app.post("/api/admin/packages")
 async def create_package(data: PackageCreate, token: str = Depends(get_admin)):
-    package = data.dict()
+    # استخدام الطريقة الحديثة model_dump بدلاً من dict المتوافقة مع Pydantic v2
+    package = data.model_dump()
     package["is_active"] = True
     result = await db.packages.insert_one(package)
     return {"status": "success", "id": str(result.inserted_id)}
@@ -244,7 +246,7 @@ async def get_stats(token: str = Depends(get_admin)):
         "total_profit": profit
     }
 
-# مسارات الموزعين والطلبات
+# 3️⃣ مسارات الموزعين وتلقي طلبات الشحن والـ الحزم
 @app.post("/api/reseller/order")
 async def place_order(data: OrderCreate, token: str = Depends(get_current_user)):
     if token["role"] != "reseller":
@@ -252,11 +254,11 @@ async def place_order(data: OrderCreate, token: str = Depends(get_current_user))
     
     package = await db.packages.find_one({"_id": ObjectId(data.package_id)})
     if not package or not package.get("is_active", True):
-        raise HTTPException(status_code=404, detail="الحزمة غير متوفرة")
+        raise HTTPException(status_code=404, detail="الحزمة المطلوبة غير متوفرة حالياً")
     
     cost = package["sale_price"]
     if token.get("balance", 0.0) < cost:
-        raise HTTPException(status_code=400, detail="رصيدك غير كافٍ")
+        raise HTTPException(status_code=400, detail="رصيدك الحالي غير كافٍ لإتمام العملية")
     
     new_balance = token["balance"] - cost
     await db.users.update_one({"_id": token["_id"]}, {"$set": {"balance": new_balance}})
@@ -298,10 +300,11 @@ async def change_transaction_status(tx_id: str, data: StatusUpdate, token: str =
         raise HTTPException(status_code=404, detail="المعاملة غير موجودة")
         
     if tx["status"] != "pending":
-        raise HTTPException(status_code=400, detail="تم التحديث مسبقاً")
+        raise HTTPException(status_code=400, detail="تم تحديث حالة هذه العملية مسبقاً")
         
     await db.transactions.update_one({"_id": ObjectId(tx_id)}, {"$set": {"status": data.status}})
     
+    # إعادة الرصيد للموزع تلقائياً فوراً إذا رفض الأدمن الطلب
     if data.status == "refunded" and tx["type"] == "order":
         reseller = await db.users.find_one({"_id": ObjectId(tx["reseller_id"])})
         if reseller:
