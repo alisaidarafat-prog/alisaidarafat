@@ -8,7 +8,7 @@ from pydantic import BaseModel, Field
 from typing import List, Optional, Dict
 from datetime import datetime, timedelta
 import jose.jwt as jwt
-from passlib.context import CryptContext
+import bcrypt
 import motor.motor_asyncio
 import httpx
 import json
@@ -31,7 +31,17 @@ JWT_SECRET = "SuperSecretRandomKey2026ForSecureLoginTokens"
 ALGORITHM = "HS256"
 TELEGRAM_BOT_TOKEN = "8991513968:AAHx33xWvNIZCJogCuIYG-py_Kjb5GvHuoI"
 
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+# Native Bcrypt helpers to avoid passlib environment bugs
+def hash_password(password: str) -> str:
+    salt = bcrypt.gensalt()
+    return bcrypt.hashpw(password.encode('utf-8'), salt).decode('utf-8')
+
+def verify_password(plain_password: str, hashed_password: str) -> bool:
+    try:
+        return bcrypt.checkpw(plain_password.encode('utf-8'), hashed_password.encode('utf-8'))
+    except Exception:
+        return False
+
 client = motor.motor_asyncio.AsyncIOMotorClient(MONGO_URL)
 db = client[DB_NAME]
 
@@ -133,7 +143,7 @@ async def startup_seed():
     if not admin:
         await resellers_col.insert_one({
             "username": "alisaidarafat",
-            "password": pwd_context.hash("alisaidarafat@7"),
+            "password": hash_password("alisaidarafat@7"),
             "name": "علي سعيد عرفات",
             "phone": "0597111277",
             "balance": 999999.0,
@@ -170,7 +180,7 @@ async def get_current_user(token: str):
 @app.post("/api/auth/login")
 async def login(req: LoginRequest):
     user = await resellers_col.find_one({"username": req.username})
-    if not user or not pwd_context.verify(req.password, user["password"]):
+    if not user or not verify_password(req.password, user["password"]):
         raise HTTPException(status_code=400, detail="اسم المستخدم أو كلمة المرور خاطئة")
     token = create_access_token(data={"sub": user["username"]})
     if "_id" in user:
@@ -232,7 +242,7 @@ async def get_resellers(user=Depends(get_current_user)):
 async def create_reseller(reseller: ResellerModel, user=Depends(get_current_user)):
     if user["role"] != "admin": raise HTTPException(status_code=403)
     data = reseller.dict()
-    data["password"] = pwd_context.hash(data["password"] or "123456")
+    data["password"] = hash_password(data["password"] or "123456")
     try:
         res = await resellers_col.insert_one(data)
         data["_id"] = str(res.inserted_id)
