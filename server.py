@@ -1,7 +1,7 @@
 import os
 from fastapi import FastAPI, HTTPException, Depends, status, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 from typing import List, Optional
 from motor.motor_asyncio import AsyncIOMotorClient
 from bson import ObjectId
@@ -9,7 +9,7 @@ import bcrypt
 import jwt
 from datetime import datetime, timedelta
 
-# إعداد التطبيق
+# إعداد تطبيق FastAPI
 app = FastAPI(title="Telecom Reseller Distribution System")
 
 app.add_middleware(
@@ -20,7 +20,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# الاتصال بقاعدة البيانات (MongoDB Atlas أو محلي)
+# الاتصال بقاعدة البيانات
 MONGO_DETAILS = os.getenv("MONGO_URL", "mongodb+srv://saidarafat:saidarafat7@cluster0.pbg4o.mongodb.net/telecom_db?retryWrites=True&w=majority")
 client = AsyncIOMotorClient(MONGO_DETAILS)
 db = client.get_default_database()
@@ -28,9 +28,8 @@ db = client.get_default_database()
 JWT_SECRET = os.getenv("JWT_SECRET", "SUPER_SECRET_KEY_123456789_ALISAIDARAFAT")
 ALGORITHM = "HS256"
 
-# دالات التشفير المحدثة لتفادي خطأ الـ 72 حرف
+# دالات التشفير
 def hash_password(password: str) -> str:
-    # نقوم بأخذ أول 72 حرف فقط لضمان عدم حدوث ValueError نهائياً
     pwd_bytes = password.encode('utf-8')[:72]
     return bcrypt.hashpw(pwd_bytes, bcrypt.gensalt()).decode('utf-8')
 
@@ -47,7 +46,6 @@ def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
     to_encode.update({"exp": expire})
     return jwt.encode(to_encode, JWT_SECRET, algorithm=ALGORITHM)
 
-# تحويل كائنات البيانات لتتوافق مع البايرثون
 def pydantic_user(user) -> dict:
     return {
         "_id": str(user["_id"]),
@@ -73,8 +71,8 @@ class ResellerCreate(BaseModel):
 
 class PackageCreate(BaseModel):
     name: str
-    type: str  # jawwal / ooredoo
-    category: str  # credit / bundle
+    type: str
+    category: str
     cost_price: float
     sale_price: float
     description: Optional[str] = ""
@@ -88,17 +86,14 @@ class BalanceUpdate(BaseModel):
     note: Optional[str] = ""
 
 class StatusUpdate(BaseModel):
-    status: str # completed / refunded
+    status: str
 
-# مدير اتصالات WebSocket البث المباشر
+# مدير اتصالات WebSocket
 class ConnectionManager:
     def __init__(self):
         self.active_connections: List[WebSocket] = []
 
-    async list_connections(self):
-        return self.active_connections
-
-    async connect(self, websocket: WebSocket):
+    async def connect(self, websocket: WebSocket):
         await websocket.accept()
         self.active_connections.append(websocket)
 
@@ -106,7 +101,7 @@ class ConnectionManager:
         if websocket in self.active_connections:
             self.active_connections.remove(websocket)
 
-    async broadcast(self, message: dict):
+    async def broadcast(self, message: dict):
         for connection in self.active_connections:
             try:
                 await connection.send_json(message)
@@ -115,7 +110,7 @@ class ConnectionManager:
 
 manager = ConnectionManager()
 
-# التحقق من التوكن للاعتمادية
+# التحقق من التوكن
 async def get_current_user(token: str):
     try:
         payload = jwt.decode(token, JWT_SECRET, algorithms=[ALGORITHM])
@@ -132,10 +127,10 @@ async def get_current_user(token: str):
 async def get_admin(token: str):
     user = await get_current_user(token)
     if user["role"] != "admin":
-        raise HTTPException(status_code=403, detail="غير مصرح، هذه الصلاحية للمسؤول فقط")
+        raise HTTPException(status_code=403, detail="غير مصرح")
     return user
 
-# إنشاء حساب أدمن افتراضي عند الإقلاع الفوري للمنظومة
+# عند الإقلاع
 @app.on_event("startup")
 async def startup_db_client():
     admin = await db.users.find_one({"username": "alisaidarafat"})
@@ -150,7 +145,7 @@ async def startup_db_client():
             "is_active": True
         })
 
-# 1️⃣ مسارات المصادقة
+# مسارات المصادقة
 @app.post("/api/auth/login")
 async def login(data: LoginModel):
     user = await db.users.find_one({"username": data.username.strip()})
@@ -160,7 +155,6 @@ async def login(data: LoginModel):
     token = create_access_token(data={"sub": user["username"]})
     return {"token": token, "user": pydantic_user(user)}
 
-# WebSocket للمزامنة الفورية الجارية
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket, token: str):
     await manager.connect(websocket)
@@ -170,12 +164,12 @@ async def websocket_endpoint(websocket: WebSocket, token: str):
     except WebSocketDisconnect:
         manager.disconnect(websocket)
 
-# 2️⃣ مسارات الإدارة (الأدمن)
+# مسارات الإدارة
 @app.post("/api/admin/resellers")
 async def create_reseller(data: ResellerCreate, token: str = Depends(get_admin)):
     existing = await db.users.find_one({"username": data.username.strip()})
     if existing:
-        raise HTTPException(status_code=400, detail="اسم المستخدم هذا مسجل مسبقاً في النظام")
+        raise HTTPException(status_code=400, detail="اسم المستخدم مسجل مسبقاً")
     
     reseller = {
         "username": data.username.strip(),
@@ -187,9 +181,7 @@ async def create_reseller(data: ResellerCreate, token: str = Depends(get_admin))
         "is_active": True
     }
     result = await db.users.insert_one(reseller)
-    reseller["_id"] = str(result.inserted_id)
-    await manager.broadcast({"event": "reseller_created", "data": {"name": data.name}})
-    return {"status": "success", "id": reseller["_id"]}
+    return {"status": "success", "id": str(result.inserted_id)}
 
 @app.get("/api/admin/resellers")
 async def get_resellers(token: str = Depends(get_admin)):
@@ -205,7 +197,6 @@ async def update_reseller_balance(r_id: str, data: BalanceUpdate, token: str = D
     new_balance = user.get("balance", 0.0) + data.amount
     await db.users.update_one({"_id": ObjectId(r_id)}, {"$set": {"balance": new_balance}})
     
-    # تسجيل حركة شحن الرصيد في العمليات
     await db.transactions.insert_one({
         "reseller_id": r_id,
         "reseller_name": user["name"],
@@ -239,7 +230,6 @@ async def get_stats(token: str = Depends(get_admin)):
     r_count = await db.users.count_documents({"role": "reseller"})
     p_count = await db.packages.count_documents({})
     
-    # حساب الأرباح التقريبية من الطلبات المكتملة
     pipeline = [
         {"$match": {"status": "completed", "type": "order"}},
         {"$group": {"_id": None, "total": {"$sum": "$profit"}}}
@@ -254,21 +244,20 @@ async def get_stats(token: str = Depends(get_admin)):
         "total_profit": profit
     }
 
-# 3️⃣ مسارات الموزع والعمليات المشتركة
+# مسارات الموزعين والطلبات
 @app.post("/api/reseller/order")
 async def place_order(data: OrderCreate, token: str = Depends(get_current_user)):
     if token["role"] != "reseller":
-        raise HTTPException(status_code=403, detail="فقط الموزعين يمكنهم إرسال طلبات")
+        raise HTTPException(status_code=403, detail="غير مسموح")
     
     package = await db.packages.find_one({"_id": ObjectId(data.package_id)})
     if not package or not package.get("is_active", True):
-        raise HTTPException(status_code=404, detail="الحزمة أو العرض المطلوب غير متوفر حالياً")
+        raise HTTPException(status_code=404, detail="الحزمة غير متوفرة")
     
     cost = package["sale_price"]
     if token.get("balance", 0.0) < cost:
-        raise HTTPException(status_code=400, detail="رصيدك الحالي غير كافٍ لإتمام هذا الطلب")
+        raise HTTPException(status_code=400, detail="رصيدك غير كافٍ")
     
-    # خصم مؤقت للرصيد
     new_balance = token["balance"] - cost
     await db.users.update_one({"_id": token["_id"]}, {"$set": {"balance": new_balance}})
     
@@ -309,11 +298,10 @@ async def change_transaction_status(tx_id: str, data: StatusUpdate, token: str =
         raise HTTPException(status_code=404, detail="المعاملة غير موجودة")
         
     if tx["status"] != "pending":
-        raise HTTPException(status_code=400, detail="تم تحديث حالة هذه المعاملة مسبقاً")
+        raise HTTPException(status_code=400, detail="تم التحديث مسبقاً")
         
     await db.transactions.update_one({"_id": ObjectId(tx_id)}, {"$set": {"status": data.status}})
     
-    # إعادة الرصيد للموزع إذا تم رفض الطلب (refunded)
     if data.status == "refunded" and tx["type"] == "order":
         reseller = await db.users.find_one({"_id": ObjectId(tx["reseller_id"])})
         if reseller:
