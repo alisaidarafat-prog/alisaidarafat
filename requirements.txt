@@ -4,3 +4,5 @@ motor
 passlib[bcrypt]
 python-jose[cryptography]
 httpx
+pydantic
+bcrypt
