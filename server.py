@@ -1,320 +1,444 @@
-import os
-from fastapi import FastAPI, HTTPException, Depends, status, WebSocket, WebSocketDisconnect
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from typing import List, Optional
+"""
+Telecom Reseller Distribution System
+FastAPI + MongoDB backend with JWT auth, WebSockets and Telegram notifications.
+"""
+from fastapi import FastAPI, APIRouter, Depends, HTTPException, status, WebSocket, WebSocketDisconnect
+from fastapi.security import OAuth2PasswordBearer
+from dotenv import load_dotenv
+from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
-from bson import ObjectId
+import os
+import logging
+import asyncio
+import uuid
 import bcrypt
 import jwt
-from datetime import datetime, timedelta
+import httpx
+from pathlib import Path
+from pydantic import BaseModel, Field, ConfigDict
+from typing import List, Optional, Literal, Dict, Set
+from datetime import datetime, timezone, timedelta
 
-# إعداد تطبيق FastAPI
-app = FastAPI(title="Telecom Reseller Distribution System")
+ROOT_DIR = Path(__file__).parent
+load_dotenv(ROOT_DIR / '.env')
 
-# تفعيل الـ CORS لتسريع وتسهيل اتصال الواجهة بالسيرفر
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# ============== Config ==============
+MONGO_URL = os.environ['MONGO_URL']
+DB_NAME = os.environ['DB_NAME']
+JWT_SECRET = os.environ['JWT_SECRET']
+JWT_ALGORITHM = "HS256"
+JWT_EXPIRE_HOURS = 24 * 7  # 7 days
 
-# الاتصال بقاعدة البيانات MongoDB Atlas
-MONGO_DETAILS = os.getenv("MONGO_URL", "mongodb+srv://saidarafat:saidarafat7@cluster0.pbg4o.mongodb.net/telecom_db?retryWrites=True&w=majority")
-client = AsyncIOMotorClient(MONGO_DETAILS)
-db = client.get_default_database()
+TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', '')
 
-JWT_SECRET = os.getenv("JWT_SECRET", "SUPER_SECRET_KEY_123456789_ALISAIDARAFAT")
-ALGORITHM = "HS256"
+# Initial admin credentials (used at first boot only)
+DEFAULT_ADMIN_USERNAME = os.environ.get('ADMIN_USERNAME', '')
+DEFAULT_ADMIN_PASSWORD = os.environ.get('ADMIN_PASSWORD', '')
+DEFAULT_ADMIN_NAME = os.environ.get('ADMIN_NAME', '')
 
-# دالات التشفير والتحقق الحديثة لتفادي أخطاء الـ 72 حرف (bcrypt)
-def hash_password(password: str) -> str:
-    pwd_bytes = password.encode('utf-8')[:72]
-    return bcrypt.hashpw(pwd_bytes, bcrypt.gensalt()).decode('utf-8')
+# ============== Mongo ==============
+client = AsyncIOMotorClient(MONGO_URL)
+db = client[DB_NAME]
 
-def verify_password(plain_password: str, hashed_password: str) -> bool:
-    try:
-        pwd_bytes = plain_password.encode('utf-8')[:72]
-        return bcrypt.checkpw(pwd_bytes, hashed_password.encode('utf-8'))
-    except Exception:
-        return False
+# ============== App ==============
+app = FastAPI(title="Telecom Reseller API")
+api_router = APIRouter(prefix="/api")
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="api/auth/login", auto_error=False)
 
-def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
-    to_encode = data.copy()
-    expire = datetime.utcnow() + (expires_delta or timedelta(days=7))
-    to_encode.update({"exp": expire})
-    return jwt.encode(to_encode, JWT_SECRET, algorithm=ALGORITHM)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger("telecom")
 
-def pydantic_user(user) -> dict:
-    return {
-        "_id": str(user["_id"]),
-        "username": user["username"],
-        "name": user["name"],
-        "phone": user["phone"],
-        "role": user["role"],
-        "balance": user.get("balance", 0.0),
-        "is_active": user.get("is_active", True)
-    }
+# ============== Models ==============
+class UserPublic(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    id: str
+    username: str
+    name: str
+    role: Literal["admin", "reseller"]
+    balance: float = 0.0
+    active: bool = True
+    created_at: str
 
-# نماذج البيانات الحديثة (Pydantic v2 Models)
-class LoginModel(BaseModel):
+class LoginRequest(BaseModel):
     username: str
     password: str
 
-class ResellerCreate(BaseModel):
+class LoginResponse(BaseModel):
+    token: str
+    user: UserPublic
+
+class CreateResellerRequest(BaseModel):
     username: str
     password: str
     name: str
-    phone: str
-    balance: float = 0.0
+    initial_balance: float = 0.0
+
+class UpdateResellerRequest(BaseModel):
+    name: Optional[str] = None
+    password: Optional[str] = None
+    active: Optional[bool] = None
+
+class AdjustBalanceRequest(BaseModel):
+    amount: float
+    note: Optional[str] = None
 
 class PackageCreate(BaseModel):
     name: str
+    type: Literal["balance", "internet", "minutes", "sms"]
+    price: float
+    active: bool = True
+    description: Optional[str] = None
+
+class PackageUpdate(BaseModel):
+    name: Optional[str] = None
+    type: Optional[Literal["balance", "internet", "minutes", "sms"]] = None
+    price: Optional[float] = None
+    active: Optional[bool] = None
+    description: Optional[str] = None
+
+class Package(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    id: str
+    name: str
     type: str
-    category: str
-    cost_price: float
-    sale_price: float
-    description: Optional[str] = ""
+    price: float
+    active: bool
+    description: Optional[str] = None
+    created_at: str
 
 class OrderCreate(BaseModel):
+    customer_phone: str
     package_id: str
-    target_number: str
 
-class BalanceUpdate(BaseModel):
-    amount: float
-    note: Optional[str] = ""
+class Order(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    id: str
+    reseller_id: str
+    reseller_name: str
+    reseller_username: str
+    customer_phone: str
+    package_id: str
+    package_name: str
+    package_type: str
+    price: float
+    status: Literal["pending", "success", "failed"]
+    fail_reason: Optional[str] = None
+    created_at: str
+    updated_at: str
 
-class StatusUpdate(BaseModel):
-    status: str
+class OrderAction(BaseModel):
+    reason: Optional[str] = None
 
-# مدير اتصالات البث المباشر WebSocket
+class SettingsUpdate(BaseModel):
+    telegram_chat_id: Optional[str] = None
+    telegram_enabled: Optional[bool] = None
+
+class SettingsModel(BaseModel):
+    telegram_chat_id: str = ""
+    telegram_enabled: bool = True
+
+# ============== Helpers ==============
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+def hash_password(password: str) -> str:
+    return bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+
+def verify_password(password: str, hashed: str) -> bool:
+    try:
+        return bcrypt.checkpw(password.encode("utf-8"), hashed.encode("utf-8"))
+    except Exception:
+        return False
+
+def create_jwt(user_id: str, role: str) -> str:
+    payload = {
+        "sub": user_id,
+        "role": role,
+        "exp": datetime.now(timezone.utc) + timedelta(hours=JWT_EXPIRE_HOURS),
+    }
+    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
+
+def decode_jwt(token: str) -> dict:
+    return jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+
+def user_doc_to_public(doc: dict) -> UserPublic:
+    return UserPublic(
+        id=doc["id"], username=doc["username"], name=doc["name"], role=doc["role"],
+        balance=doc.get("balance", 0.0), active=doc.get("active", True), created_at=doc["created_at"],
+    )
+
+async def get_current_user(token: Optional[str] = Depends(oauth2_scheme)) -> dict:
+    if not token:
+        raise HTTPException(status_code=401, detail="Missing token")
+    try:
+        payload = decode_jwt(token)
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Token expired")
+    except Exception:
+        raise HTTPException(status_code=401, detail="Invalid token")
+    user_id = payload.get("sub")
+    user = await db.users.find_one({"id": user_id}, {"_id": 0})
+    if not user or not user.get("active", True):
+        raise HTTPException(status_code=401, detail="User not found or inactive")
+    return user
+
+async def require_admin(user: dict = Depends(get_current_user)) -> dict:
+    if user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Admin only")
+    return user
+
+async def require_reseller(user: dict = Depends(get_current_user)) -> dict:
+    if user.get("role") != "reseller":
+        raise HTTPException(status_code=403, detail="Reseller only")
+    return user
+
+# ============== WebSocket Manager ==============
 class ConnectionManager:
     def __init__(self):
-        self.active_connections: List[WebSocket] = []
+        self.active: Dict[str, Set[WebSocket]] = {}
 
-    async def connect(self, websocket: WebSocket):
+    async def connect(self, user_id: str, websocket: WebSocket):
         await websocket.accept()
-        self.active_connections.append(websocket)
+        self.active.setdefault(user_id, set()).add(websocket)
 
-    def disconnect(self, websocket: WebSocket):
-        if websocket in self.active_connections:
-            self.active_connections.remove(websocket)
+    def disconnect(self, user_id: str, websocket: WebSocket):
+        if user_id in self.active:
+            self.active[user_id].discard(websocket)
+            if not self.active[user_id]:
+                self.active.pop(user_id, None)
 
-    async def broadcast(self, message: dict):
-        for connection in self.active_connections:
+    async def send_to_user(self, user_id: str, message: dict):
+        if user_id not in self.active:
+            return
+        dead = []
+        for ws in list(self.active[user_id]):
             try:
-                await connection.send_json(message)
+                await ws.send_json(message)
             except Exception:
-                pass
+                dead.append(ws)
+        for ws in dead:
+            self.active[user_id].discard(ws)
 
 manager = ConnectionManager()
 
-# التحقق من صلاحيات وجلسات المستخدمين والـ Admin
-async def get_current_user(token: str):
+# ============== Telegram ==============
+async def send_telegram(text: str):
+    settings_doc = await db.settings.find_one({"_id": "global"}) or {}
+    if not settings_doc.get("telegram_enabled", True):
+        return
+    chat_id = settings_doc.get("telegram_chat_id", "")
+    if not chat_id or not TELEGRAM_BOT_TOKEN:
+        logger.info("Telegram skipped (no chat_id)")
+        return
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True}
     try:
-        payload = jwt.decode(token, JWT_SECRET, algorithms=[ALGORITHM])
-        username: str = payload.get("sub")
-        if username is None:
-            raise HTTPException(status_code=401, detail="توكن غير صالح")
-        user = await db.users.find_one({"username": username})
-        if user is None:
-            raise HTTPException(status_code=401, detail="المستخدم غير موجود")
-        return user
-    except Exception:
-        raise HTTPException(status_code=401, detail="جلسة غير صالحة أو منتهية")
+        async with httpx.AsyncClient(timeout=10.0) as client_http:
+            r = await client_http.post(url, json=payload)
+            if r.status_code != 200:
+                logger.warning(f"Telegram non-200: {r.status_code} {r.text}")
+    except Exception as e:
+        logger.error(f"Telegram send failed: {e}")
 
-async def get_admin(token: str):
-    user = await get_current_user(token)
-    if user["role"] != "admin":
-        raise HTTPException(status_code=403, detail="غير مصرح، الصلاحية للمسؤول فقط")
-    return user
-
-# إنشاء حساب الأدمن الافتراضي تلقائياً عند تشغيل السيرفر لأول مرة
+# ============== Startup ==============
 @app.on_event("startup")
-async def startup_db_client():
-    admin = await db.users.find_one({"username": "alisaidarafat"})
-    if not admin:
-        await db.users.insert_one({
-            "username": "alisaidarafat",
-            "password": hash_password("alisaidarafat@7"),
-            "name": "علي سيد عرفات",
-            "phone": "+972597111277",
+async def on_startup():
+    await db.users.create_index("username", unique=True)
+    await db.users.create_index("id", unique=True)
+    await db.packages.create_index("id", unique=True)
+    await db.orders.create_index("id", unique=True)
+    await db.orders.create_index("reseller_id")
+    await db.orders.create_index("status")
+
+    existing = await db.users.find_one({"role": "admin"})
+    if not existing and DEFAULT_ADMIN_USERNAME and DEFAULT_ADMIN_PASSWORD:
+        admin_doc = {
+            "id": str(uuid.uuid4()),
+            "username": DEFAULT_ADMIN_USERNAME,
+            "name": DEFAULT_ADMIN_NAME,
+            "password": hash_password(DEFAULT_ADMIN_PASSWORD),
             "role": "admin",
-            "balance": 1000000.0,
-            "is_active": True
-        })
+            "balance": 0.0,
+            "active": True,
+            "created_at": now_iso(),
+        }
+        await db.users.insert_one(admin_doc)
+        logger.info(f"Seeded admin: {DEFAULT_ADMIN_USERNAME}")
 
-# 1️⃣ مسارات تسجيل الدخول والمصادقة
-@app.post("/api/auth/login")
-async def login(data: LoginModel):
-    user = await db.users.find_one({"username": data.username.strip()})
-    if not user or not verify_password(data.password, user["password"]):
-        raise HTTPException(status_code=400, detail="اسم المستخدم أو كلمة المرور غير صحيحة")
-    
-    token = create_access_token(data={"sub": user["username"]})
-    return {"token": token, "user": pydantic_user(user)}
+    if not await db.settings.find_one({"_id": "global"}):
+        await db.settings.insert_one({"_id": "global", "telegram_chat_id": "", "telegram_enabled": True})
 
-@app.websocket("/ws")
-async def websocket_endpoint(websocket: WebSocket, token: str):
-    await manager.connect(websocket)
-    try:
-        while True:
-            await websocket.receive_text()
-    except WebSocketDisconnect:
-        manager.disconnect(websocket)
+@app.on_event("shutdown")
+async def on_shutdown():
+    client.close()
 
-# 2️⃣ مسارات الإدارة والتحكم (الأدمن)
-@app.post("/api/admin/resellers")
-async def create_reseller(data: ResellerCreate, token: str = Depends(get_admin)):
-    existing = await db.users.find_one({"username": data.username.strip()})
+# ============== Auth ==============
+@api_router.post("/auth/login", response_model=LoginResponse)
+async def login(req: LoginRequest):
+    user = await db.users.find_one({"username": req.username}, {"_id": 0})
+    if not user or not verify_password(req.password, user["password"]):
+        raise HTTPException(status_code=401, detail="اسم المستخدم أو كلمة المرور غير صحيحة")
+    if not user.get("active", True):
+        raise HTTPException(status_code=403, detail="الحساب غير نشط")
+    token = create_jwt(user["id"], user["role"])
+    return LoginResponse(token=token, user=user_doc_to_public(user))
+
+@api_router.get("/auth/me", response_model=UserPublic)
+async def get_me(user: dict = Depends(get_current_user)):
+    return user_doc_to_public(user)
+
+# ============== Admin: Resellers ==============
+@api_router.get("/admin/resellers", response_model=List[UserPublic])
+async def list_resellers(_: dict = Depends(require_admin)):
+    docs = await db.users.find({"role": "reseller"}, {"_id": 0, "password": 0}).sort("created_at", -1).to_list(1000)
+    return [UserPublic(
+        id=d["id"], username=d["username"], name=d["name"], role=d["role"],
+        balance=d.get("balance", 0.0), active=d.get("active", True), created_at=d["created_at"]
+    ) for d in docs]
+
+@api_router.post("/admin/resellers", response_model=UserPublic)
+async def create_reseller(req: CreateResellerRequest, _: dict = Depends(require_admin)):
+    existing = await db.users.find_one({"username": req.username})
     if existing:
-        raise HTTPException(status_code=400, detail="اسم المستخدم مسجل مسبقاً في النظام")
-    
-    reseller = {
-        "username": data.username.strip(),
-        "password": hash_password(data.password),
-        "name": data.name,
-        "phone": data.phone,
-        "role": "reseller",
-        "balance": data.balance,
-        "is_active": True
+        raise HTTPException(status_code=400, detail="اسم المستخدم محجوز")
+    doc = {
+        "id": str(uuid.uuid4()), "username": req.username, "name": req.name,
+        "password": hash_password(req.password), "role": "reseller",
+        "balance": float(req.initial_balance or 0.0), "active": True, "created_at": now_iso(),
     }
-    result = await db.users.insert_one(reseller)
-    return {"status": "success", "id": str(result.inserted_id)}
+    await db.users.insert_one(doc)
+    if req.initial_balance and req.initial_balance > 0:
+        await db.balance_logs.insert_one({
+            "id": str(uuid.uuid4()), "reseller_id": doc["id"], "amount": float(req.initial_balance),
+            "type": "topup", "note": "رصيد ابتدائي", "created_at": now_iso(),
+        })
+    return user_doc_to_public(doc)
 
-@app.get("/api/admin/resellers")
-async def get_resellers(token: str = Depends(get_admin)):
-    resellers = await db.users.find({"role": "reseller"}).to_list(1000)
-    return [pydantic_user(r) for r in resellers]
-
-@app.post("/api/admin/resellers/{r_id}/balance")
-async def update_reseller_balance(r_id: str, data: BalanceUpdate, token: str = Depends(get_admin)):
-    user = await db.users.find_one({"_id": ObjectId(r_id)})
+@api_router.patch("/admin/resellers/{reseller_id}", response_model=UserPublic)
+async def update_reseller(reseller_id: str, req: UpdateResellerRequest, _: dict = Depends(require_admin)):
+    user = await db.users.find_one({"id": reseller_id, "role": "reseller"})
     if not user:
-        raise HTTPException(status_code=404, detail="الموزع غير موجود")
-    
-    new_balance = user.get("balance", 0.0) + data.amount
-    await db.users.update_one({"_id": ObjectId(r_id)}, {"$set": {"balance": new_balance}})
-    
-    await db.transactions.insert_one({
-        "reseller_id": r_id,
-        "reseller_name": user["name"],
-        "type": "deposit" if data.amount > 0 else "withdrawal",
-        "details": f"شحن رصيد مباشر من الإدارة: {data.note}",
-        "target": "-",
-        "amount": abs(data.amount),
-        "status": "completed",
-        "timestamp": datetime.utcnow().isoformat()
+        raise HTTPException(status_code=404, detail="المسوق غير موجود")
+    updates = {}
+    if req.name is not None: updates["name"] = req.name
+    if req.password: updates["password"] = hash_password(req.password)
+    if req.active is not None: updates["active"] = req.active
+    if updates:
+        await db.users.update_one({"id": reseller_id}, {"$set": updates})
+    updated = await db.users.find_one({"id": reseller_id}, {"_id": 0})
+    return user_doc_to_public(updated)
+
+@api_router.post("/admin/resellers/{reseller_id}/balance", response_model=UserPublic)
+async def adjust_balance(reseller_id: str, req: AdjustBalanceRequest, admin: dict = Depends(require_admin)):
+    user = await db.users.find_one({"id": reseller_id, "role": "reseller"})
+    if not user:
+        raise HTTPException(status_code=404, detail="المسوق غير موجود")
+    new_balance = float(user.get("balance", 0.0)) + float(req.amount)
+    if new_balance < 0:
+        raise HTTPException(status_code=400, detail="لا يمكن أن يكون الرصيد سالباً")
+    await db.users.update_one({"id": reseller_id}, {"$set": {"balance": new_balance}})
+    await db.balance_logs.insert_one({
+        "id": str(uuid.uuid4()), "reseller_id": reseller_id, "amount": float(req.amount),
+        "type": "topup" if req.amount >= 0 else "deduct", "note": req.note or "",
+        "by_admin": admin["id"], "created_at": now_iso(),
     })
-    
-    await manager.broadcast({"event": "order_update", "data": {"reseller_id": r_id}})
-    return {"status": "success", "new_balance": new_balance}
+    await manager.send_to_user(reseller_id, {"event": "balance_updated", "balance": new_balance})
+    updated = await db.users.find_one({"id": reseller_id}, {"_id": 0})
+    return user_doc_to_public(updated)
 
-@app.post("/api/admin/packages")
-async def create_package(data: PackageCreate, token: str = Depends(get_admin)):
-    # استخدام الطريقة الحديثة model_dump بدلاً من dict المتوافقة مع Pydantic v2
-    package = data.model_dump()
-    package["is_active"] = True
-    result = await db.packages.insert_one(package)
-    return {"status": "success", "id": str(result.inserted_id)}
+@api_router.delete("/admin/resellers/{reseller_id}")
+async def delete_reseller(reseller_id: str, _: dict = Depends(require_admin)):
+    user = await db.users.find_one({"id": reseller_id, "role": "reseller"})
+    if not user:
+        raise HTTPException(status_code=404, detail="المسوق غير موجود")
+    await db.users.delete_one({"id": reseller_id})
+    return {"ok": True}
 
-@app.get("/api/admin/packages")
-async def get_packages():
-    pkgs = await db.packages.find().to_list(1000)
-    for p in pkgs:
-        p["_id"] = str(p["_id"])
-    return pkgs
+# ============== Admin: Packages ==============
+@api_router.get("/admin/packages", response_model=List[Package])
+async def admin_list_packages(_: dict = Depends(require_admin)):
+    docs = await db.packages.find({}, {"_id": 0}).sort("created_at", -1).to_list(1000)
+    return docs
 
-@app.get("/api/admin/stats")
-async def get_stats(token: str = Depends(get_admin)):
-    r_count = await db.users.count_documents({"role": "reseller"})
-    p_count = await db.packages.count_documents({})
-    
-    pipeline = [
-        {"$match": {"status": "completed", "type": "order"}},
-        {"$group": {"_id": None, "total": {"$sum": "$profit"}}}
-    ]
-    cursor = db.transactions.aggregate(pipeline)
-    result = await cursor.to_list(1)
-    profit = result[0]["total"] if result else 0.0
-    
-    return {
-        "resellers_count": r_count,
-        "packages_count": p_count,
-        "total_profit": profit
+@api_router.post("/admin/packages", response_model=Package)
+async def create_package(req: PackageCreate, _: dict = Depends(require_admin)):
+    doc = {
+        "id": str(uuid.uuid4()), "name": req.name, "type": req.type,
+        "price": float(req.price), "active": req.active,
+        "description": req.description or "", "created_at": now_iso(),
     }
+    await db.packages.insert_one(doc)
+    doc.pop("_id", None)
+    return doc
 
-# 3️⃣ مسارات الموزعين وتلقي طلبات الشحن والـ الحزم
-@app.post("/api/reseller/order")
-async def place_order(data: OrderCreate, token: str = Depends(get_current_user)):
-    if token["role"] != "reseller":
-        raise HTTPException(status_code=403, detail="غير مسموح")
-    
-    package = await db.packages.find_one({"_id": ObjectId(data.package_id)})
-    if not package or not package.get("is_active", True):
-        raise HTTPException(status_code=404, detail="الحزمة المطلوبة غير متوفرة حالياً")
-    
-    cost = package["sale_price"]
-    if token.get("balance", 0.0) < cost:
-        raise HTTPException(status_code=400, detail="رصيدك الحالي غير كافٍ لإتمام العملية")
-    
-    new_balance = token["balance"] - cost
-    await db.users.update_one({"_id": token["_id"]}, {"$set": {"balance": new_balance}})
-    
-    profit = package["sale_price"] - package["cost_price"]
-    
-    order_tx = {
-        "reseller_id": str(token["_id"]),
-        "reseller_name": token["name"],
-        "type": "order",
-        "package_id": data.package_id,
-        "details": package["name"],
-        "target": data.target_number,
-        "amount": cost,
-        "profit": profit,
-        "status": "pending",
-        "timestamp": datetime.utcnow().isoformat()
-    }
-    await db.transactions.insert_one(order_tx)
-    await manager.broadcast({"event": "new_order", "data": order_tx})
-    
-    return {"status": "success", "new_balance": new_balance}
+@api_router.patch("/admin/packages/{package_id}", response_model=Package)
+async def update_package(package_id: str, req: PackageUpdate, _: dict = Depends(require_admin)):
+    pkg = await db.packages.find_one({"id": package_id})
+    if not pkg:
+        raise HTTPException(status_code=404, detail="الحزمة غير موجودة")
+    updates = {k: v for k, v in req.model_dump(exclude_unset=True).items() if v is not None}
+    if updates:
+        await db.packages.update_one({"id": package_id}, {"$set": updates})
+    updated = await db.packages.find_one({"id": package_id}, {"_id": 0})
+    return updated
 
-@app.get("/api/transactions")
-async def get_transactions(token: str = Depends(get_current_user)):
-    if token["role"] == "admin":
-        txs = await db.transactions.find().sort("timestamp", -1).to_list(1000)
-    else:
-        txs = await db.transactions.find({"reseller_id": str(token["_id"])}).sort("timestamp", -1).to_list(1000)
-        
-    for t in txs:
-        t["_id"] = str(t["_id"])
-    return txs
+@api_router.delete("/admin/packages/{package_id}")
+async def delete_package(package_id: str, _: dict = Depends(require_admin)):
+    res = await db.packages.delete_one({"id": package_id})
+    if res.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="الحزمة غير موجودة")
+    return {"ok": True}
 
-@app.post("/api/admin/transactions/{tx_id}/status")
-async def change_transaction_status(tx_id: str, data: StatusUpdate, token: str = Depends(get_admin)):
-    tx = await db.transactions.find_one({"_id": ObjectId(tx_id)})
-    if not tx:
-        raise HTTPException(status_code=404, detail="المعاملة غير موجودة")
-        
-    if tx["status"] != "pending":
-        raise HTTPException(status_code=400, detail="تم تحديث حالة هذه العملية مسبقاً")
-        
-    await db.transactions.update_one({"_id": ObjectId(tx_id)}, {"$set": {"status": data.status}})
-    
-    # إعادة الرصيد للموزع تلقائياً فوراً إذا رفض الأدمن الطلب
-    if data.status == "refunded" and tx["type"] == "order":
-        reseller = await db.users.find_one({"_id": ObjectId(tx["reseller_id"])})
-        if reseller:
-            refunded_balance = reseller.get("balance", 0.0) + tx["amount"]
-            await db.users.update_one({"_id": ObjectId(tx["reseller_id"])}, {"$set": {"balance": refunded_balance}})
-            
-    await manager.broadcast({"event": "status_updated", "data": {"tx_id": tx_id, "status": data.status, "reseller_id": tx["reseller_id"]}})
-    return {"status": "success"}
+# ============== Admin: Orders ==============
+@api_router.get("/admin/orders", response_model=List[Order])
+async def admin_list_orders(status_filter: Optional[str] = None, _: dict = Depends(require_admin)):
+    q = {}
+    if status_filter:
+        q["status"] = status_filter
+    docs = await db.orders.find(q, {"_id": 0}).sort("created_at", -1).to_list(1000)
+    return docs
 
-@app.post("/api/admin/telegram-config")
-async def config_telegram(data: dict, token: str = Depends(get_admin)):
-    await db.config.update_one({"key": "telegram"}, {"$set": {"chat_id": data.get("chat_id")}}, upsert=True)
-    return {"status": "success"}
+@api_router.post("/admin/orders/{order_id}/approve", response_model=Order)
+async def approve_order(order_id: str, admin: dict = Depends(require_admin)):
+    order = await db.orders.find_one({"id": order_id})
+    if not order:
+        raise HTTPException(status_code=404, detail="الطلب غير موجود")
+    if order["status"] != "pending":
+        raise HTTPException(status_code=400, detail="الطلب ليس قيد الانتظار")
+    await db.orders.update_one(
+        {"id": order_id},
+        {"$set": {"status": "success", "updated_at": now_iso(), "approved_by": admin["id"]}},
+    )
+    updated = await db.orders.find_one({"id": order_id}, {"_id": 0})
+    await manager.send_to_user(order["reseller_id"], {"event": "order_updated", "order": updated})
+    return updated
+
+@api_router.post("/admin/orders/{order_id}/reject", response_model=Order)
+async def reject_order(order_id: str, action: OrderAction, admin: dict = Depends(require_admin)):
+    order = await db.orders.find_one({"id": order_id})
+    if not order:
+        raise HTTPException(status_code=404, detail="الطلب غير موجود")
+    if order["status"] != "pending":
+        raise HTTPException(status_code=400, detail="الطلب ليس قيد الانتظار")
+    reseller = await db.users.find_one({"id": order["reseller_id"]})
+    if reseller:
+        new_balance = float(reseller.get("balance", 0.0)) + float(order["price"])
+        await db.users.update_one({"id": reseller["id"]}, {"$set": {"balance": new_balance}})
+        await db.balance_logs.insert_one({
+            "id": str(uuid.uuid4()), "reseller_id": reseller["id"],
+            "amount": float(order["price"]), "type": "refund",
+            "note": f"استرداد طلب #{order_id[:8]} - {action.reason or 'رفض من الإدارة'}",
+            "by_admin": admin["id"], "created_at": now_iso(),
+        })
+        await manager.send_to_user(reseller["id"], {"event": "balance_updated", "balance": new_balance})
+    await db.orders.update_one(
+        {"id": order_id},
+        {"$set": {
+            "status": "failed",
+            "fail_reason": action.reason or "تم رفض الطلب من الإدارة",
+            "updated_at": now_iso(), "rejected_by": admin["id"],
+        }},
+    )
+    updated = await db.orders.find_one({"id": order_id}, {"_id": 0})
+    await manager.send_to_user(order["reseller_id"], {"event": "order_updated", "order": updated})
+    return updated
